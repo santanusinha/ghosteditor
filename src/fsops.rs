@@ -25,10 +25,7 @@ pub async fn write_atomic(path: &Path, content: &str) -> Result<WriteOutcome, st
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).await?;
 
-    let temp: PathBuf = parent.join(format!(
-        ".ghostedit-tmp-{}",
-        std::process::id()
-    ));
+    let temp: PathBuf = parent.join(format!(".ghostedit-tmp-{}", std::process::id()));
 
     // Write and fsync the temp file first.
     {
@@ -78,7 +75,11 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".ghostedit-tmp"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".ghostedit-tmp")
+            })
             .collect();
         assert!(leftovers.is_empty());
     }

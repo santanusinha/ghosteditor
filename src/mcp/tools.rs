@@ -28,9 +28,7 @@ pub struct Tool {
 /// Future alias so the handler table needs no generics.
 pub mod futures_run {
     use super::*;
-    pub type BoxedFuture = std::pin::Pin<
-        Box<dyn Future<Output = Result<Value, ToolError>> + Send>,
-    >;
+    pub type BoxedFuture = std::pin::Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send>>;
     use std::future::Future;
 }
 
@@ -166,21 +164,524 @@ fn registry() -> &'static Vec<Tool> {
             deadline_kind: DeadlineKind::Edit,
             run: run_edit_text,
         },
+        Tool {
+            name: "goto_definition",
+            description: "Find where the symbol at a position is defined, through the language server.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based" },
+                    "column": { "type": "integer", "description": "1-based" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path", "line", "column"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_goto_definition,
+        },
+        Tool {
+            name: "hover",
+            description: "Type and documentation for the symbol at a position.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based" },
+                    "column": { "type": "integer", "description": "1-based" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path", "line", "column"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_hover,
+        },
+        Tool {
+            name: "references",
+            description: "Find every reference to the symbol at a position.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based" },
+                    "column": { "type": "integer", "description": "1-based" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path", "line", "column"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_references,
+        },
+        Tool {
+            name: "diagnostics",
+            description: "The latest diagnostics for a file, pushed by its language server. Empty when no server is attached.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_diagnostics,
+        },
+        Tool {
+            name: "rename",
+            description: "Rename a symbol across the workspace. Applies the edit and saves every touched file atomically.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based" },
+                    "column": { "type": "integer", "description": "1-based" },
+                    "new_name": { "type": "string" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path", "line", "column", "new_name"]
+            }),
+            deadline_kind: DeadlineKind::Rename,
+            run: run_rename,
+        },
     ])
+}
+
+// ---------- Phase 1: LSP handlers (P1.7-P1.11) ----------
+
+fn run_goto_definition(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "goto_definition";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let line =
+            arg_usize(&arguments, "line").ok_or_else(|| invalid(tool, "line is required"))?;
+        let column =
+            arg_usize(&arguments, "column").ok_or_else(|| invalid(tool, "column is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        lsp_position_call(
+            server,
+            tool,
+            path,
+            raw,
+            line,
+            column,
+            "textDocument/definition",
+        )
+        .await
+    })
+}
+
+fn run_hover(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "hover";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let line =
+            arg_usize(&arguments, "line").ok_or_else(|| invalid(tool, "line is required"))?;
+        let column =
+            arg_usize(&arguments, "column").ok_or_else(|| invalid(tool, "column is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        lsp_position_call(server, tool, path, raw, line, column, "textDocument/hover").await
+    })
+}
+
+fn run_references(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "references";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let line =
+            arg_usize(&arguments, "line").ok_or_else(|| invalid(tool, "line is required"))?;
+        let column =
+            arg_usize(&arguments, "column").ok_or_else(|| invalid(tool, "column is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        let (path, raw) = (path, raw);
+        ensure_did_open(&server, &path).await?;
+        let deadline = deadline_for(&server, &path, DeadlineKind::Read, &arguments);
+        let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
+            return missing_server(&raw);
+        };
+        let params = json!({
+            "textDocument": { "uri": uri_string(&path) },
+            "position": { "line": line - 1, "character": column - 1 },
+            "context": { "includeDeclaration": true }
+        });
+        let result = client
+            .request("textDocument/references", params, deadline)
+            .await?;
+        let items = result.as_array().cloned().unwrap_or_default();
+        let lines: Vec<String> = items
+            .iter()
+            .map(|item| {
+                let uri = item["uri"].as_str().unwrap_or("");
+                let l = item["range"]["start"]["line"].as_u64().unwrap_or(0) + 1;
+                let c = item["range"]["start"]["character"].as_u64().unwrap_or(0) + 1;
+                format!("{uri}:{l}:{c}")
+            })
+            .collect();
+        let text = if lines.is_empty() {
+            "No references found.".to_string()
+        } else {
+            lines.join("\n")
+        };
+        Ok(json!({ "text": text, "count": items.len() }))
+    })
+}
+
+fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "diagnostics";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        ensure_did_open(&server, &path).await?;
+        let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
+            return Ok(json!({
+                "text": "No language server attached. Diagnostics unavailable.",
+                "diagnostics": [],
+            }));
+        };
+        // Give a fast server a moment to push its first batch (P1.5).
+        let settle = 300u64;
+        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
+        let pushed = client.diagnostics_for(&path).await;
+        let items = pushed.map(|p| p.diagnostics).unwrap_or_default();
+        let names = ["ERROR", "WARN", "INFO", "HINT"];
+        let rendered: Vec<String> = items
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}:{} {} {}",
+                    d.range.start.line + 1,
+                    d.range.start.character + 1,
+                    severity_name(d.severity),
+                    d.message.replace('\n', " ")
+                )
+            })
+            .collect();
+        let text = if rendered.is_empty() {
+            "No diagnostics.".to_string()
+        } else {
+            rendered.join("\n")
+        };
+        Ok(json!({
+            "text": text,
+            "diagnostics": items.iter().map(|d| json!({
+                "line": d.range.start.line + 1,
+                "column": d.range.start.character + 1,
+                "severity": severity_name(d.severity),
+                "message": d.message,
+                "source": d.source,
+            })).collect::<Vec<_>>()
+        }))
+    })
+}
+
+fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "rename";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let line =
+            arg_usize(&arguments, "line").ok_or_else(|| invalid(tool, "line is required"))?;
+        let column =
+            arg_usize(&arguments, "column").ok_or_else(|| invalid(tool, "column is required"))?;
+        let new_name =
+            arg_str(&arguments, "new_name").ok_or_else(|| invalid(tool, "new_name is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        ensure_did_open(&server, &path).await?;
+        let deadline = deadline_for(&server, &path, DeadlineKind::Rename, &arguments);
+        let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
+            return missing_server(&raw);
+        };
+        let params = json!({
+            "textDocument": { "uri": uri_string(&path) },
+            "position": { "line": line - 1, "character": column - 1 },
+            "newName": new_name
+        });
+        let result = client
+            .request("textDocument/rename", params, deadline)
+            .await?;
+        let workspace_edit = match result.as_object() {
+            Some(object) => object.clone(),
+            None => {
+                return Err(ToolError::new(
+                    ErrorKind::Invalid {
+                        hint: "the server does not support rename at this position".to_string(),
+                    },
+                    tool,
+                ))
+            }
+        };
+        apply_workspace_edit(&server, &workspace_edit).await
+    })
+}
+
+/// Open the document in the DocStore and send didOpen to the server (P1.4).
+async fn ensure_did_open(server: &Arc<Server>, path: &Path) -> Result<(), ToolError> {
+    let text = {
+        let mut store = server.store.lock().await;
+        store.open(path).await.map_err(|e| internal("open", e))?;
+        store.text(path)
+    };
+    let Some(text) = text else { return Ok(()) };
+    if let Some((language, client)) = server.lsp.client_for_path(path).await? {
+        client.did_open_once(path, &language, &text).await;
+    }
+    Ok(())
+}
+
+/// The effective deadline for a call, honoring per-server overrides.
+fn deadline_for(server: &Arc<Server>, path: &Path, kind: DeadlineKind, arguments: &Value) -> u64 {
+    if let Some((language, _)) = server.config.language_for(path) {
+        let d = server.config.deadlines_for(&language);
+        let ceiling = match kind {
+            DeadlineKind::Read => d.read,
+            DeadlineKind::Edit => d.edit,
+            DeadlineKind::Rename => d.rename,
+            DeadlineKind::Symbol => d.symbol,
+        };
+        return clamp_agent(ceiling, arguments);
+    }
+    let ceiling = match kind {
+        DeadlineKind::Read => server.config.defaults.read,
+        DeadlineKind::Edit => server.config.defaults.edit,
+        DeadlineKind::Rename => server.config.defaults.rename,
+        DeadlineKind::Symbol => server.config.defaults.symbol,
+    };
+    clamp_agent(ceiling, arguments)
+}
+
+fn uri_string(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    format!("file://{}", absolute.display())
+}
+
+fn missing_server(raw: &str) -> Result<Value, ToolError> {
+    Ok(json!({
+        "text": format!("No language server configured for {raw}."),
+        "locations": [],
+    }))
+}
+
+/// One LSP position call: definition or hover (P1.7, P1.8).
+async fn lsp_position_call(
+    server: Arc<Server>,
+    tool: &'static str,
+    path: PathBuf,
+    raw: String,
+    line: usize,
+    column: usize,
+    method: &'static str,
+) -> Result<Value, ToolError> {
+    ensure_did_open(&server, &path).await?;
+    let deadline = deadline_for(&server, &path, DeadlineKind::Read, &Value::Null);
+    let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
+        return missing_server(&raw);
+    };
+    let params = json!({
+        "textDocument": { "uri": uri_string(&path) },
+        "position": { "line": line - 1, "character": column - 1 }
+    });
+    let mut result = client.request(method, params.clone(), deadline).await?;
+    // Cold-start guard: an empty answer often means the server is still
+    // analyzing. Wait for its first diagnostics push, then retry once
+    // within the same budget (the agent-lsp fuzzy-retry pattern).
+    let empty = match method {
+        "textDocument/hover" => hover_is_empty(&result),
+        _ => definition_is_empty(&result),
+    };
+    if empty {
+        let mut waited = 0u64;
+        while waited < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            waited += 500;
+            if let Some(pushed) = client.diagnostics_for(&path).await {
+                if !pushed.diagnostics.is_empty() {
+                    break;
+                }
+            }
+        }
+        result = client.request(method, params, deadline).await?;
+    }
+    match method {
+        "textDocument/hover" => {
+            let text = hover_text(&result);
+            Ok(json!({ "text": text }))
+        }
+        _ => {
+            let items = definition_locations(&result);
+            let text = if items.is_empty() {
+                "No definition found.".to_string()
+            } else {
+                items.join("\n")
+            };
+            Ok(json!({ "text": text, "locations": items }))
+        }
+    }
+}
+
+fn hover_text(result: &Value) -> String {
+    let contents = &result["contents"];
+    if let Some(value) = contents.as_str() {
+        return value.to_string();
+    }
+    if let Some(value) = contents["value"].as_str() {
+        return value.to_string();
+    }
+    "No hover information.".to_string()
+}
+
+fn definition_locations(result: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let items = match result.as_array() {
+        Some(items) => items.clone(),
+        None => vec![result.clone()],
+    };
+    for item in items {
+        let uri = item["uri"]
+            .as_str()
+            .or_else(|| item["targetUri"].as_str())
+            .unwrap_or("");
+        if uri.is_empty() {
+            continue;
+        }
+        let range = &item["range"];
+        let l = range["start"]["line"].as_u64().unwrap_or(0) + 1;
+        let c = range["start"]["character"].as_u64().unwrap_or(0) + 1;
+        out.push(format!("{uri}:{l}:{c}"));
+    }
+    out
+}
+
+/// Apply a WorkspaceEdit: edit each file in memory, save atomically (P1.11).
+async fn apply_workspace_edit(
+    server: &Arc<Server>,
+    edit: &serde_json::Map<String, Value>,
+) -> Result<Value, ToolError> {
+    let mut changed_files: Vec<String> = Vec::new();
+    // Servers answer with `changes`, `documentChanges`, or both (LSP spec).
+    let mut per_file: Vec<(String, &Value)> = Vec::new();
+    if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits) in changes {
+            per_file.push((uri.clone(), edits));
+        }
+    }
+    if let Some(document_changes) = edit.get("documentChanges").and_then(|c| c.as_array()) {
+        for change in document_changes {
+            if let Some(uri) = change
+                .get("textDocument")
+                .and_then(|t| t.get("uri"))
+                .and_then(|u| u.as_str())
+            {
+                if let Some(edits) = change.get("edits") {
+                    per_file.push((uri.to_string(), edits));
+                }
+            }
+        }
+    }
+    for (uri, edits) in per_file {
+        let path = uri_to_path(&uri);
+        let mut store = server.store.lock().await;
+        store.open(&path).await.map_err(|e| internal("rename", e))?;
+        let mut text = store.text(&path).unwrap_or_default();
+        apply_text_edits(&mut text, edits);
+        if let Some(document) = store.document_mut(&path) {
+            document.text = text.clone();
+            document.version += 1;
+        }
+        crate::fsops::write_atomic(&path, &text)
+            .await
+            .map_err(|e| internal("rename", e))?;
+        store
+            .saved(&path)
+            .await
+            .map_err(|e| internal("rename", e))?;
+        changed_files.push(path.display().to_string());
+    }
+    let text = if changed_files.is_empty() {
+        "No changes produced.".to_string()
+    } else {
+        format!(
+            "Renamed in {} file(s): {}",
+            changed_files.len(),
+            changed_files.join(", ")
+        )
+    };
+    Ok(json!({ "text": text, "files": changed_files }))
+}
+
+/// Apply LSP TextEdits to text. Edits are UTF-16 offsets (P1.11).
+fn apply_text_edits(text: &mut String, edits: &Value) {
+    let mut ranges: Vec<(usize, usize, String)> = Vec::new();
+    if let Some(list) = edits.as_array() {
+        for edit in list {
+            let start = utf16_to_byte(
+                text,
+                edit["range"]["start"]["line"].as_u64().unwrap_or(0),
+                edit["range"]["start"]["character"].as_u64().unwrap_or(0),
+            );
+            let end = utf16_to_byte(
+                text,
+                edit["range"]["end"]["line"].as_u64().unwrap_or(0),
+                edit["range"]["end"]["character"].as_u64().unwrap_or(0),
+            );
+            let new_text = edit["newText"].as_str().unwrap_or("").to_string();
+            ranges.push((start, end, new_text));
+        }
+    }
+    // Apply back-to-front so offsets stay valid.
+    ranges.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, end, new_text) in ranges {
+        let start = start.min(text.len());
+        let end = end.min(text.len()).max(start);
+        text.replace_range(start..end, &new_text);
+    }
+}
+
+/// Convert a UTF-16 line/character pair to a byte offset in `text`.
+fn utf16_to_byte(text: &str, line: u64, character: u64) -> usize {
+    let mut current_line = 0u64;
+    for (i, ch) in text.char_indices() {
+        if current_line == line {
+            // Walk this line counting UTF-16 units to the target.
+            let mut units = 0u64;
+            for (j, c) in text[i..].char_indices() {
+                if units >= character || c == '\n' {
+                    return i + j;
+                }
+                units += c.len_utf16() as u64;
+            }
+            return text.len();
+        }
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    text.len()
+}
+
+fn uri_to_path(uri: &str) -> PathBuf {
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    PathBuf::from(stripped)
 }
 
 // ---------- handlers ----------
 
 fn arg_str(arguments: &Value, key: &str) -> Option<String> {
-    arguments.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    arguments
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn arg_usize(arguments: &Value, key: &str) -> Option<usize> {
-    arguments.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
+    arguments
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
 }
 
 fn arg_bool(arguments: &Value, key: &str, default: bool) -> bool {
-    arguments.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+    arguments
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
 }
 
 fn resolve_path(config: &Config, raw: &str) -> PathBuf {
@@ -203,7 +704,8 @@ use std::future::Future;
 
 fn run_open_file(server: Arc<Server>, arguments: Value) -> BoxedFuture {
     box_future(async move {
-        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid("open_file", "path is required"))?;
+        let raw =
+            arg_str(&arguments, "path").ok_or_else(|| invalid("open_file", "path is required"))?;
         let path = resolve_path(&server.config, &raw);
         let facts = server
             .store
@@ -233,12 +735,16 @@ fn run_open_file(server: Arc<Server>, arguments: Value) -> BoxedFuture {
 
 fn run_read_file(server: Arc<Server>, arguments: Value) -> BoxedFuture {
     box_future(async move {
-        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid("read_file", "path is required"))?;
+        let raw =
+            arg_str(&arguments, "path").ok_or_else(|| invalid("read_file", "path is required"))?;
         let path = resolve_path(&server.config, &raw);
         let start = arg_usize(&arguments, "start_line");
         let end = arg_usize(&arguments, "end_line");
         let mut store = server.store.lock().await;
-        store.open(&path).await.map_err(|e| internal("read_file", e))?;
+        store
+            .open(&path)
+            .await
+            .map_err(|e| internal("read_file", e))?;
         let slice = store
             .read(&path, start, end)
             .ok_or_else(|| internal("read_file", "document missing after open"))?;
@@ -296,7 +802,11 @@ fn run_edit_lines(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             None
         };
 
-        let mode = if outcome.mode == crate::docstore::EditMode::Insert { "insert" } else { "replace" };
+        let mode = if outcome.mode == crate::docstore::EditMode::Insert {
+            "insert"
+        } else {
+            "replace"
+        };
         Ok(json!({
             "text": format!(
                 "{} {} lines {}..{}. new_line_count={} saved={}",
@@ -321,8 +831,10 @@ fn run_edit_text(server: Arc<Server>, arguments: Value) -> BoxedFuture {
     box_future(async move {
         let tool = "edit_text";
         let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
-        let old_text = arg_str(&arguments, "old_text").ok_or_else(|| invalid(tool, "old_text is required"))?;
-        let new_text = arg_str(&arguments, "new_text").ok_or_else(|| invalid(tool, "new_text is required"))?;
+        let old_text =
+            arg_str(&arguments, "old_text").ok_or_else(|| invalid(tool, "old_text is required"))?;
+        let new_text =
+            arg_str(&arguments, "new_text").ok_or_else(|| invalid(tool, "new_text is required"))?;
         let replace_all = arg_bool(&arguments, "replace_all", false);
         let save = arg_bool(&arguments, "save", true);
         let path = resolve_path(&server.config, &raw);
@@ -422,7 +934,10 @@ fn closest_window(haystack: &str, needle: &str) -> (usize, String) {
     let needle_lines: Vec<&str> = needle.split('\n').collect();
     let mut best = 1;
     let mut best_score = 0usize;
-    for i in 0..hay_lines.len().saturating_sub(needle_lines.len().saturating_sub(1)) {
+    for i in 0..hay_lines
+        .len()
+        .saturating_sub(needle_lines.len().saturating_sub(1))
+    {
         let score = needle_lines
             .iter()
             .enumerate()
@@ -440,6 +955,28 @@ fn closest_window(haystack: &str, needle: &str) -> (usize, String) {
         .copied()
         .collect();
     (best, window.join("\n"))
+}
+
+fn hover_is_empty(result: &Value) -> bool {
+    result.get("result").map(|r| r.is_null()).unwrap_or(true)
+        || hover_text(result).contains("No hover information")
+}
+
+fn definition_is_empty(result: &Value) -> bool {
+    match result.as_array() {
+        Some(items) => items.is_empty(),
+        None => result.get("result").map(|r| r.is_null()).unwrap_or(true),
+    }
+}
+
+fn severity_name(severity: Option<lsp_types::DiagnosticSeverity>) -> &'static str {
+    match severity {
+        Some(lsp_types::DiagnosticSeverity::ERROR) => "ERROR",
+        Some(lsp_types::DiagnosticSeverity::WARNING) => "WARN",
+        Some(lsp_types::DiagnosticSeverity::INFORMATION) => "INFO",
+        Some(lsp_types::DiagnosticSeverity::HINT) => "HINT",
+        _ => "HINT",
+    }
 }
 
 fn invalid(tool: &str, hint: impl AsRef<str>) -> ToolError {

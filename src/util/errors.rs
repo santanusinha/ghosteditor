@@ -53,7 +53,10 @@ pub struct ToolError {
 
 impl ToolError {
     pub fn new(kind: ErrorKind, tool: impl Into<String>) -> Self {
-        Self { kind, tool: tool.into() }
+        Self {
+            kind,
+            tool: tool.into(),
+        }
     }
 
     /// Structured payload. Text stays short; details live in the fields.

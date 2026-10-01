@@ -25,7 +25,7 @@ pub struct Deadlines {
 }
 
 fn default_read() -> u64 {
-    2_000
+    10_000
 }
 fn default_edit() -> u64 {
     5_000

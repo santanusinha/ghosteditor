@@ -73,7 +73,11 @@ impl Document {
         self.version += 1;
 
         Ok(EditOutcome {
-            mode: if insert { EditMode::Insert } else { EditMode::Replace },
+            mode: if insert {
+                EditMode::Insert
+            } else {
+                EditMode::Replace
+            },
             new_line_count: self.line_count(),
         })
     }
@@ -110,9 +114,7 @@ impl DocStore {
     /// Open a document: read from disk, or reuse the open copy when nothing
     /// changed externally (P0.10).
     pub async fn open(&mut self, path: &Path) -> Result<OpenFacts, std::io::Error> {
-        let absolute = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let meta = fs::metadata(&absolute).await;
 
         if meta.is_err() {
@@ -142,7 +144,11 @@ impl DocStore {
         }
 
         let text = fs::read_to_string(&absolute).await?;
-        let version = self.documents.get(&absolute).map(|d| d.version).unwrap_or(0);
+        let version = self
+            .documents
+            .get(&absolute)
+            .map(|d| d.version)
+            .unwrap_or(0);
         let document = Document {
             path: absolute.clone(),
             text,

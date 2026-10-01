@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::docstore::DocStore;
+use crate::lsp::LspManager;
 use crate::mcp::tools;
 use crate::util::logging;
 use crate::util::{ErrorKind, ToolError};
@@ -21,13 +22,15 @@ use crate::util::{ErrorKind, ToolError};
 pub struct Server {
     pub config: Config,
     pub store: Mutex<DocStore>,
+    pub lsp: LspManager,
 }
 
 impl Server {
     pub fn new(config: Config) -> Self {
         Self {
-            config,
+            lsp: LspManager::new(config.clone()),
             store: Mutex::new(DocStore::new()),
+            config,
         }
     }
 
@@ -147,13 +150,16 @@ async fn handle_tools_call(
                 let payload = error.to_payload();
                 // MCP tool errors are results with isError, not protocol
                 // errors: the call completed, with a negative outcome.
-                ok_result(Some(id), json!({
-                    "content": [
-                        { "type": "text", "text": error.to_string() }
-                    ],
-                    "isError": true,
-                    "structuredContent": payload,
-                }))
+                ok_result(
+                    Some(id),
+                    json!({
+                        "content": [
+                            { "type": "text", "text": error.to_string() }
+                        ],
+                        "isError": true,
+                        "structuredContent": payload,
+                    }),
+                )
             }
             Err(_) => {
                 let tool_error = ToolError::new(
@@ -164,13 +170,16 @@ async fn handle_tools_call(
                     tool_name,
                 );
                 let payload = tool_error.to_payload();
-                ok_result(Some(id), json!({
-                    "content": [
-                        { "type": "text", "text": tool_error.to_string() }
-                    ],
-                    "isError": true,
-                    "structuredContent": payload,
-                }))
+                ok_result(
+                    Some(id),
+                    json!({
+                        "content": [
+                            { "type": "text", "text": tool_error.to_string() }
+                        ],
+                        "isError": true,
+                        "structuredContent": payload,
+                    }),
+                )
             }
         }
     } else {
