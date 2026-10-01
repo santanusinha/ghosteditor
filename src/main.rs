@@ -14,6 +14,7 @@ mod walker;
 use std::path::PathBuf;
 
 use config::Config;
+use util::logging;
 
 fn main() {
     // Logs go to stderr. Stdout carries the MCP protocol only.
@@ -32,7 +33,18 @@ fn main() {
             }
         };
         let server = mcp::Server::new(config);
-        server.run().await;
+
+        // P0.17: clean shutdown. SIGTERM or Ctrl-C stops the run loop;
+        // the loop exits when the signal future resolves instead of stdin.
+        let run = server.run();
+        tokio::select! {
+            _ = run => {}
+            _ = tokio::signal::ctrl_c() => {
+                logging::info("interrupt received; exiting");
+            }
+        }
+        // Children die with the process; tokio Child drops kill on exit.
+        logging::info("shutdown complete");
     });
 }
 
