@@ -66,6 +66,7 @@ pub struct Language {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cwd: PathBuf,
+    #[allow(dead_code)]
     pub global_path: PathBuf,
     pub languages: BTreeMap<String, Language>,
     pub defaults: Deadlines,

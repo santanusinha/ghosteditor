@@ -39,6 +39,8 @@ pub enum DeadlineKind {
     Read,
     Edit,
     Rename,
+    /// Reserved for the Phase 2 symbol tools.
+    #[allow(dead_code)]
     Symbol,
 }
 
@@ -342,7 +344,7 @@ fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
         let pushed = client.diagnostics_for(&path).await;
         let items = pushed.map(|p| p.diagnostics).unwrap_or_default();
-        let names = ["ERROR", "WARN", "INFO", "HINT"];
+        let _names = ["ERROR", "WARN", "INFO", "HINT"];
         let rendered: Vec<String> = items
             .iter()
             .map(|d| {
@@ -462,7 +464,7 @@ fn missing_server(raw: &str) -> Result<Value, ToolError> {
 /// One LSP position call: definition or hover (P1.7, P1.8).
 async fn lsp_position_call(
     server: Arc<Server>,
-    tool: &'static str,
+    _tool: &'static str,
     path: PathBuf,
     raw: String,
     line: usize,
@@ -498,6 +500,22 @@ async fn lsp_position_call(
             }
         }
         result = client.request(method, params, deadline).await?;
+    }
+    // Fuzzy position fallback (P1.14): an agent often lands on whitespace
+    // next to the identifier. Nudge left/right to an identifier character
+    // and retry once.
+    let still_empty = match method {
+        "textDocument/hover" => hover_is_empty(&result),
+        _ => definition_is_empty(&result),
+    };
+    if still_empty {
+        if let Some(nudged) = nudge_position(&server, &path, line, column).await {
+            let params = json!({
+                "textDocument": { "uri": uri_string(&path) },
+                "position": { "line": nudged.0, "character": nudged.1 }
+            });
+            result = client.request(method, params, deadline).await?;
+        }
     }
     match method {
         "textDocument/hover" => {
@@ -955,6 +973,43 @@ fn closest_window(haystack: &str, needle: &str) -> (usize, String) {
         .copied()
         .collect();
     (best, window.join("\n"))
+}
+
+/// Find the nearest identifier character around a position, 0-based LSP
+/// coordinates. Searches outward on the same line (P1.14).
+async fn nudge_position(
+    server: &Arc<Server>,
+    path: &Path,
+    line: usize,
+    column: usize,
+) -> Option<(u64, u64)> {
+    let text = {
+        let mut store = server.store.lock().await;
+        store.open(path).await.ok()?;
+        store.text(path)
+    }?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line_text = lines.get(line - 1)?;
+    let char_index = column - 1;
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Search outward from the given column.
+    for distance in 0..line_text.len() {
+        for candidate in [
+            char_index as i64 - distance as i64,
+            char_index as i64 + distance as i64,
+        ] {
+            if candidate < 0 {
+                continue;
+            }
+            let at = line_text.char_indices().nth(candidate as usize);
+            if let Some((_, c)) = at {
+                if is_ident(c) {
+                    return Some(((line - 1) as u64, candidate as u64));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn hover_is_empty(result: &Value) -> bool {

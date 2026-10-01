@@ -13,10 +13,12 @@ use tokio::fs;
 /// Facts about one open document.
 #[derive(Debug, Clone)]
 pub struct Document {
+    #[allow(dead_code)]
     pub path: PathBuf,
     /// The text as a string. `\n` line endings, no final newline guarantee.
     pub text: String,
     /// Grows by one with every in-memory edit.
+    #[allow(dead_code)]
     pub version: u64,
     /// mtime of the disk file at load or last save. External-change guard.
     disk_mtime: Option<SystemTime>,
@@ -83,6 +85,7 @@ impl Document {
     }
 
     /// The mtime/size pair this document last saw on disk.
+    #[allow(dead_code)]
     pub fn disk_state(&self) -> (Option<SystemTime>, u64) {
         (self.disk_mtime, self.disk_size)
     }
@@ -218,6 +221,7 @@ pub struct OpenFacts {
     pub exists: bool,
     pub line_count: usize,
     pub reloaded: bool,
+    #[allow(dead_code)]
     pub version: u64,
 }
 

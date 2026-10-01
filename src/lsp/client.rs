@@ -22,7 +22,7 @@ use lsp_types::{
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::util::{ErrorKind, ToolError};
@@ -41,12 +41,16 @@ struct Pending {
 
 /// State shared between the writer task and the callers.
 struct Inner {
-    child: Child,
+    /// Held so the child stays alive; kill happens on drop.
+    #[allow(dead_code)]
+    child: Mutex<Child>,
     writer: mpsc::Sender<String>,
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     /// Diagnostics pushed by the server, per document URI.
     diagnostics: Mutex<HashMap<Uri, PublishDiagnosticsParams>>,
+    /// Set when the child exited. Later requests fail fast (P1.13).
+    dead: std::sync::atomic::AtomicBool,
 }
 
 /// One live language server client.
@@ -79,7 +83,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
+            .map_err(|_e| {
                 ToolError::new(
                     ErrorKind::Missing {
                         what: format!("language server {program}"),
@@ -113,11 +117,12 @@ impl LspClient {
 
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
         let inner = Arc::new(Inner {
-            child,
+            child: Mutex::new(child),
             writer: writer_tx,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             diagnostics: Mutex::new(HashMap::new()),
+            dead: std::sync::atomic::AtomicBool::new(false),
         });
 
         // Writer task: one line per JSON message.
@@ -151,6 +156,7 @@ impl LspClient {
         })?;
         let params = InitializeParams {
             process_id: Some(std::process::id()),
+            #[allow(deprecated)]
             root_uri: Some(root_uri.clone()),
             initialization_options,
             capabilities: ClientCapabilities {
@@ -184,6 +190,11 @@ impl LspClient {
         Ok(())
     }
 
+    /// True when the child exited (P1.13). Callers can check and degrade.
+    pub fn is_dead(&self) -> bool {
+        self.inner.dead.load(Ordering::Relaxed)
+    }
+
     /// Send a request and wait with a deadline. A late reply is dropped.
     pub async fn request(
         &self,
@@ -191,6 +202,15 @@ impl LspClient {
         params: Value,
         deadline_ms: u64,
     ) -> Result<Value, ToolError> {
+        if self.is_dead() {
+            return Err(ToolError::new(
+                ErrorKind::Missing {
+                    what: "language server (crashed)".to_string(),
+                    next_step: "retry the call; the manager may restart it".to_string(),
+                },
+                "lsp",
+            ));
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.inner
@@ -274,6 +294,7 @@ impl LspClient {
     }
 
     /// didChange with full text sync (v1; incremental arrives later).
+    #[allow(dead_code)]
     pub async fn did_change(&self, path: &Path, text: &str, version: i32) {
         let uri = match file_uri(path) {
             Some(uri) => uri,
@@ -295,6 +316,7 @@ impl LspClient {
     }
 
     /// didClose a document.
+    #[allow(dead_code)]
     pub async fn did_close(&self, path: &Path) {
         let uri = match file_uri(path) {
             Some(uri) => uri,
@@ -317,9 +339,10 @@ impl LspClient {
     }
 
     /// Stop the server.
+    #[allow(dead_code)]
     pub async fn shutdown(&self) {
         let _ = self.request("shutdown", json!({}), 2_000).await;
-        self.notify("exit", json!({}));
+        self.notify("exit", json!({})).await;
     }
 }
 
@@ -351,9 +374,17 @@ async fn reader_task(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) => break, // server exited
+            Ok(0) => {
+                // Server exited: mark dead so callers fail fast (P1.13).
+                inner.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::util::logging::info("lsp: server exited");
+                break;
+            }
             Ok(_) => {}
-            Err(_) => break,
+            Err(_) => {
+                inner.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {

@@ -19,7 +19,14 @@ pub struct LspManager {
     clients: Mutex<HashMap<String, Arc<LspClient>>>,
     /// Spawn-in-progress guards so two tools do not spawn twice.
     spawning: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Restart bookkeeping per language: (count, window start) (P1.13).
+    restarts: Mutex<HashMap<String, (u32, std::time::Instant)>>,
 }
+
+/// Cap: at most 3 restarts per 60 s, then the language stays down with
+/// a reason (plan 4.5.7).
+const RESTART_CAP: u32 = 3;
+const RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl LspManager {
     pub fn new(config: Config) -> Self {
@@ -27,6 +34,7 @@ impl LspManager {
             config,
             clients: Mutex::new(HashMap::new()),
             spawning: Mutex::new(HashMap::new()),
+            restarts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -38,7 +46,48 @@ impl LspManager {
             None => return Ok(None),
         };
         if let Some(client) = self.clients.lock().await.get(language) {
-            return Ok(Some(client.clone()));
+            if client.is_dead() {
+                // Dead child: try a restart under the cap (P1.13).
+                let restartable = {
+                    let mut restarts = self.restarts.lock().await;
+                    let entry = restarts
+                        .entry(language.to_string())
+                        .or_insert((0, std::time::Instant::now()));
+                    if entry.1.elapsed() > RESTART_WINDOW {
+                        *entry = (0, std::time::Instant::now());
+                    }
+                    if entry.0 < RESTART_CAP {
+                        entry.0 += 1;
+                        crate::util::logging::info(format!(
+                            "lsp: restarting {language} (attempt {}/{})",
+                            entry.0, RESTART_CAP
+                        ));
+                        true
+                    } else {
+                        crate::util::logging::info(format!(
+                            "lsp: {language} stays down: restart cap reached"
+                        ));
+                        false
+                    }
+                };
+                if !restartable {
+                    self.clients.lock().await.remove(language);
+                    return Err(ToolError::new(
+                        crate::util::ErrorKind::Missing {
+                            what: format!(
+                                "language server for {language}: crashed 3 times in 60 s"
+                            ),
+                            next_step:
+                                "file operations still work; fix or restart the server manually"
+                                    .to_string(),
+                        },
+                        "lsp",
+                    ));
+                }
+                self.clients.lock().await.remove(language);
+            } else {
+                return Ok(Some(client.clone()));
+            }
         }
 
         // One spawner at a time per language.
