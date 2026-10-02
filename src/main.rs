@@ -8,6 +8,7 @@ mod docstore;
 mod fsops;
 mod lsp;
 mod mcp;
+mod registry;
 mod util;
 mod walker;
 

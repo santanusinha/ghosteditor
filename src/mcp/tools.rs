@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::fsops::{write_atomic, WriteOutcome};
 use crate::mcp::Server;
+use crate::registry::jobs as registry_jobs;
 use crate::util::{ErrorKind, ToolError};
 
 /// A tool description visible to the agent.
@@ -42,6 +43,7 @@ pub enum DeadlineKind {
     /// Reserved for the Phase 2 symbol tools.
     #[allow(dead_code)]
     Symbol,
+    Install,
 }
 
 impl Tool {
@@ -53,6 +55,7 @@ impl Tool {
             DeadlineKind::Edit => defaults.edit,
             DeadlineKind::Rename => defaults.rename,
             DeadlineKind::Symbol => defaults.symbol,
+            DeadlineKind::Install => defaults.install,
         };
         // Optional per-language override wins over the global default.
         if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
@@ -63,6 +66,7 @@ impl Tool {
                     DeadlineKind::Edit => override_ms.edit,
                     DeadlineKind::Rename => override_ms.rename,
                     DeadlineKind::Symbol => override_ms.symbol,
+                    DeadlineKind::Install => override_ms.install,
                 };
                 return clamp_agent(ceiling, arguments);
             }
@@ -99,7 +103,8 @@ pub fn lookup(name: &str) -> Option<&'static Tool> {
 /// Built once on first use. `json!` is not const-evaluable.
 fn registry() -> &'static Vec<Tool> {
     static REGISTRY: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| vec![
+    REGISTRY.get_or_init(|| {
+        vec![
         Tool {
             name: "open_file",
             description: "Open a file. Reports facts: exists, line count, language. Never blocks on a language server.",
@@ -245,7 +250,85 @@ fn registry() -> &'static Vec<Tool> {
             deadline_kind: DeadlineKind::Rename,
             run: run_rename,
         },
-    ])
+        Tool {
+            name: "install_server",
+            description: "Install a language server from the registry by recipe name. Returns the final status, or 'running' when the deadline expires first. Poll by calling again.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Registry recipe name, e.g. pyright" },
+                    "version": { "type": "string", "description": "Optional; defaults to the recipe version" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["name"]
+            }),
+            deadline_kind: DeadlineKind::Install,
+            run: run_install_server,
+        },
+    ]
+    })
+}
+
+// ---------- Phase 2: install handler (P2.6c) ----------
+
+/// `install_server`: register the job, then wait up to the budget minus a
+/// second. The job keeps running past the budget; a later call reads the
+/// finished status (P2.6b job manager).
+fn run_install_server(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "install_server";
+        let name = arg_str(&arguments, "name").ok_or_else(|| invalid(tool, "name is required"))?;
+        let version = arg_str(&arguments, "version");
+
+        // Look the recipe up in the registry; clone it out before awaiting.
+        let recipe = {
+            let registry = server.registry.read().await;
+            match registry.by_name(&name) {
+                Some(recipe) => std::sync::Arc::new(recipe.clone()),
+                None => {
+                    return Err(ToolError::new(
+                        ErrorKind::Missing {
+                            what: format!("no registry recipe named {name}"),
+                            next_step: "check the name against the registry snapshot".to_string(),
+                        },
+                        tool,
+                    ))
+                }
+            }
+        };
+        if !recipe.supported {
+            return Err(ToolError::new(
+                ErrorKind::Invalid {
+                    hint: format!(
+                        "{name} is not supported on this platform; the overlay pins it off"
+                    ),
+                },
+                tool,
+            ));
+        }
+
+        let status = server.jobs.start(recipe, version).await;
+
+        // Wait for the job, but keep one second of the budget for the reply.
+        let budget = deadline_for(&server, Path::new(&name), DeadlineKind::Install, &arguments);
+        let wait = budget.saturating_sub(1_000).min(budget);
+        let waited = tokio::time::sleep(std::time::Duration::from_millis(wait));
+        tokio::pin!(waited);
+        loop {
+            tokio::select! {
+                _ = &mut waited => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if let Some(current) = server.jobs.status(&name).await {
+                        if current != registry_jobs::JobStatus::Running {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let final_status = server.jobs.status(&name).await.unwrap_or(status.clone());
+        Ok(registry_jobs::status_payload(&name, &final_status))
+    })
 }
 
 // ---------- Phase 1: LSP handlers (P1.7-P1.11) ----------
@@ -456,6 +539,7 @@ fn deadline_for(server: &Arc<Server>, path: &Path, kind: DeadlineKind, arguments
             DeadlineKind::Edit => d.edit,
             DeadlineKind::Rename => d.rename,
             DeadlineKind::Symbol => d.symbol,
+            DeadlineKind::Install => d.install,
         };
         return clamp_agent(ceiling, arguments);
     }
@@ -464,6 +548,7 @@ fn deadline_for(server: &Arc<Server>, path: &Path, kind: DeadlineKind, arguments
         DeadlineKind::Edit => server.config.defaults.edit,
         DeadlineKind::Rename => server.config.defaults.rename,
         DeadlineKind::Symbol => server.config.defaults.symbol,
+        DeadlineKind::Install => server.config.defaults.install,
     };
     clamp_agent(ceiling, arguments)
 }

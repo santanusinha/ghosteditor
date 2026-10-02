@@ -15,6 +15,8 @@ use crate::config::Config;
 use crate::docstore::DocStore;
 use crate::lsp::LspManager;
 use crate::mcp::tools;
+use crate::registry::jobs::JobManager;
+use crate::registry::Registry;
 use crate::util::logging;
 use crate::util::{ErrorKind, ToolError};
 
@@ -23,6 +25,10 @@ pub struct Server {
     pub config: Config,
     pub store: Mutex<DocStore>,
     pub lsp: LspManager,
+    /// Registry snapshot; swapped by the background refresh (P2.5).
+    pub registry: tokio::sync::RwLock<Registry>,
+    /// Install job table (P2.6b).
+    pub jobs: std::sync::Arc<JobManager>,
 }
 
 impl Server {
@@ -30,6 +36,8 @@ impl Server {
         Self {
             lsp: LspManager::new(config.clone()),
             store: Mutex::new(DocStore::new()),
+            registry: tokio::sync::RwLock::new(Registry::load()),
+            jobs: std::sync::Arc::new(JobManager::new()),
             config,
         }
     }
