@@ -381,7 +381,7 @@ fn run_references(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         ensure_did_open(&server, &path).await?;
         let deadline = deadline_for(&server, &path, DeadlineKind::Read, &arguments);
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
-            return missing_server(&raw);
+            return missing_server(&server, &raw, &path).await;
         };
         let params = json!({
             "textDocument": { "uri": uri_string(&path) },
@@ -417,10 +417,9 @@ fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let path = resolve_path(&server.config, &raw);
         ensure_did_open(&server, &path).await?;
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
-            return Ok(json!({
-                "text": "No language server attached. Diagnostics unavailable.",
-                "diagnostics": [],
-            }));
+            let mut reply = missing_server(&server, &raw, &path).await?;
+            reply["diagnostics"] = json!([]);
+            return Ok(reply);
         };
         // Give a fast server a moment to push its first batch (P1.5).
         let settle = 300u64;
@@ -472,7 +471,7 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         ensure_did_open(&server, &path).await?;
         let deadline = deadline_for(&server, &path, DeadlineKind::Rename, &arguments);
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
-            return missing_server(&raw);
+            return missing_server(&server, &raw, &path).await;
         };
         let params = json!({
             "textDocument": { "uri": uri_string(&path) },
@@ -558,7 +557,62 @@ fn uri_string(path: &Path) -> String {
     format!("file://{}", absolute.display())
 }
 
-fn missing_server(raw: &str) -> Result<Value, ToolError> {
+/// The reply when no language server resolves for a path (P2.6d). When the
+/// registry has install one, When it can, the reply carries the
+/// `language_server_missing` envelope with the recipe name and status.
+/// Otherwise it keeps the legacy text.
+async fn missing_server(server: &Arc<Server>, raw: &str, path: &Path) -> Result<Value, ToolError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"));
+    if let Some(ext) = ext {
+        // Hold the read guard only for the lookup; clone what we need out.
+        let candidate = {
+            let registry = server.registry.read().await;
+            let recipes = registry.recipes_for_extension(&ext);
+            // Prefer the recipe that owns this extension by default.
+            let picked = recipes
+                .iter()
+                .find(|recipe| {
+                    recipe.supported
+                        && recipe
+                            .overlay
+                            .as_ref()
+                            .is_some_and(|o| o.default_for.iter().any(|e| e == &ext))
+                })
+                .or_else(|| recipes.iter().find(|recipe| recipe.supported));
+            picked.map(|recipe| {
+                let language = recipe
+                    .overlay
+                    .as_ref()
+                    .map(|o| o.language.clone())
+                    .unwrap_or_default();
+                (recipe.name.clone(), registry.status_for(&language))
+            })
+        };
+        if let Some((name, status)) = candidate {
+            let hint = match status {
+                "not_installed" => format!(
+                    "a recipe exists for {name} but it is not installed. Call install_server with name {name}."
+                ),
+                _ => format!(
+                    "a recipe exists for {name} ({status})."
+                ),
+            };
+            return Ok(json!({
+                "text": format!("No language server configured for {raw}. {hint}"),
+                "language_server_missing": {
+                    "path": path.display().to_string(),
+                    "extension": ext,
+                    "recipe": name,
+                    "recipe_status": status,
+                    "install_command": format!("install_server {{\"name\": \"{name}\"}}"),
+                },
+                "locations": [],
+            }));
+        }
+    }
     Ok(json!({
         "text": format!("No language server configured for {raw}."),
         "locations": [],
@@ -578,7 +632,7 @@ async fn lsp_position_call(
     ensure_did_open(&server, &path).await?;
     let deadline = deadline_for(&server, &path, DeadlineKind::Read, &Value::Null);
     let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
-        return missing_server(&raw);
+        return missing_server(&server, &raw, &path).await;
     };
     let params = json!({
         "textDocument": { "uri": uri_string(&path) },
