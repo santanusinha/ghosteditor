@@ -22,6 +22,8 @@ pub struct Deadlines {
     pub rename: u64,
     #[serde(default = "default_symbol")]
     pub symbol: u64,
+    #[serde(default = "default_install")]
+    pub install: u64,
 }
 
 fn default_read() -> u64 {
@@ -36,6 +38,9 @@ fn default_rename() -> u64 {
 fn default_symbol() -> u64 {
     8_000
 }
+fn default_install() -> u64 {
+    300_000
+}
 
 impl Default for Deadlines {
     fn default() -> Self {
@@ -44,6 +49,7 @@ impl Default for Deadlines {
             edit: default_edit(),
             rename: default_rename(),
             symbol: default_symbol(),
+            install: default_install(),
         }
     }
 }
@@ -141,6 +147,7 @@ impl Config {
                 edit: override_ms.edit,
                 rename: override_ms.rename,
                 symbol: override_ms.symbol,
+                install: override_ms.install,
             },
             None => self.defaults.clone(),
         }
@@ -166,6 +173,7 @@ impl Config {
                 "edit": self.defaults.edit,
                 "rename": self.defaults.rename,
                 "symbol": self.defaults.symbol,
+                "install": self.defaults.install,
             }
         });
         let mut languages = serde_json::Map::new();
@@ -174,7 +182,8 @@ impl Config {
             languages.insert(
                 name.clone(),
                 serde_json::json!({
-                    "read": d.read, "edit": d.edit, "rename": d.rename, "symbol": d.symbol
+                    "read": d.read, "edit": d.edit, "rename": d.rename,
+                    "symbol": d.symbol, "install": d.install
                 }),
             );
         }
@@ -245,6 +254,7 @@ mod tests {
                     edit: 10_000,
                     rename: 20_000,
                     symbol: 15_000,
+                    install: 300_000,
                 }),
             },
         );

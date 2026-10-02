@@ -14,6 +14,7 @@
 //! The registry never overrides explicit user config. It fills gaps.
 
 pub mod install;
+pub mod jobs;
 pub mod transform;
 
 use serde::{Deserialize, Serialize};
