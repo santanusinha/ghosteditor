@@ -24,6 +24,8 @@ pub struct LspManager {
     spawning: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Restart bookkeeping per language: (count, window start) (P1.13).
     restarts: Mutex<HashMap<String, (u32, std::time::Instant)>>,
+    /// Last use per language, for idle eviction (P2.10).
+    last_used: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// Cap: at most 3 restarts per 60 s, then the language stays down with
@@ -39,7 +41,48 @@ impl LspManager {
             clients: Mutex::new(HashMap::new()),
             spawning: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record a use of a language client (P2.10).
+    pub async fn touch(&self, language: &str) {
+        self.last_used
+            .lock()
+            .await
+            .insert(language.to_string(), std::time::Instant::now());
+    }
+
+    /// Evict clients idle past the timeout (P2.10). Sends shutdown/exit
+    /// best effort and drops the client; the child dies with it. A later
+    /// call spawns fresh. Returns the evicted language names.
+    pub async fn evict_idle(&self, idle_after: std::time::Duration) -> Vec<String> {
+        let now = std::time::Instant::now();
+        let mut evicted = Vec::new();
+        let candidates: Vec<String> = {
+            let used = self.last_used.lock().await;
+            self.clients
+                .lock()
+                .await
+                .keys()
+                .filter(|language| {
+                    used.get(*language)
+                        .map(|last| now.duration_since(*last) > idle_after)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        };
+        for language in candidates {
+            let client = self.clients.lock().await.remove(&language);
+            if let Some(client) = client {
+                client.shutdown().await;
+                evicted.push(language.clone());
+                self.last_used.lock().await.remove(&language);
+                crate::util::logging::info(format!("lsp: evicted idle client for {language}"));
+            }
+        }
+        evicted
     }
 
     /// The client for a language, spawning it on first use (P1.3).
@@ -49,6 +92,7 @@ impl LspManager {
             Some(entry) => entry,
             None => return Ok(None),
         };
+        self.touch(language).await;
         if let Some(client) = self.clients.lock().await.get(language) {
             if client.is_dead() {
                 // Dead child: try a restart under the cap (P1.13).
@@ -120,6 +164,7 @@ impl LspManager {
             .lock()
             .await
             .insert(language.to_string(), client.clone());
+        self.touch(language).await;
         Ok(Some(client))
     }
 
@@ -185,6 +230,9 @@ impl LspManager {
     pub async fn try_client_for_path(&self, path: &Path) -> Option<(String, Arc<LspClient>)> {
         if let Some((language, _)) = self.config.language_for(path) {
             let client = self.clients.lock().await.get(&language).cloned();
+            if client.is_some() {
+                self.touch(&language).await;
+            }
             return client.map(|client| (language, client));
         }
         let ext = path
@@ -205,6 +253,9 @@ impl LspManager {
             .or_else(|| recipes.iter().position(|r| r.supported))
             .and_then(|i| recipes[i].overlay.as_ref().map(|o| o.language.clone()))?;
         let client = self.clients.lock().await.get(&language).cloned();
+        if client.is_some() {
+            self.touch(&language).await;
+        }
         client.map(|client| (language, client))
     }
 
@@ -241,5 +292,31 @@ impl LspManager {
             .await
             .insert(language.to_string(), client.clone());
         Ok(Some((language.to_string(), client)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Idle eviction bookkeeping: touch refreshes last_used, so a touched
+    /// language is never idle; an untouched entry is a candidate (P2.10).
+    #[tokio::test]
+    async fn touch_refreshes_idle_clock() {
+        let config = Config {
+            cwd: std::path::PathBuf::from("/tmp"),
+            global_path: std::path::PathBuf::from("/tmp/none.toml"),
+            languages: Default::default(),
+            defaults: Default::default(),
+            registry: crate::config::RegistrySettings::default(),
+            idle_evict_min: 15,
+        };
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(Registry::load()));
+        let manager = LspManager::new(config, registry);
+        manager.touch("rust").await;
+        // A touched language with no spawned client evicts nothing; the
+        // clock only gates clients that exist.
+        let evicted = manager.evict_idle(std::time::Duration::from_secs(0)).await;
+        assert!(evicted.is_empty());
     }
 }

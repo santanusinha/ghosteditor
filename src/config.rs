@@ -115,6 +115,8 @@ pub struct Config {
     pub languages: BTreeMap<String, Language>,
     pub defaults: Deadlines,
     pub registry: RegistrySettings,
+    /// Idle LSP child eviction in minutes; 0 disables (P2.10).
+    pub idle_evict_min: u64,
 }
 
 /// Raw file layout; languages is the main table.
@@ -183,6 +185,7 @@ impl Config {
             languages,
             defaults,
             registry,
+            idle_evict_min: 15,
         })
     }
 
@@ -285,6 +288,7 @@ mod tests {
             languages,
             defaults: Deadlines::default(),
             registry: RegistrySettings::default(),
+            idle_evict_min: 15,
         };
         let (name, entry) = config.language_for(Path::new("/a/main.py")).unwrap();
         assert_eq!(name, "python");
@@ -316,6 +320,7 @@ mod tests {
             languages,
             defaults: Deadlines::default(),
             registry: RegistrySettings::default(),
+            idle_evict_min: 15,
         };
         let d = config.deadlines_for("java");
         assert_eq!(d.read, 5_000);

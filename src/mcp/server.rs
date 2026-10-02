@@ -24,7 +24,7 @@ use crate::util::{ErrorKind, ToolError};
 pub struct Server {
     pub config: Config,
     pub store: Mutex<DocStore>,
-    pub lsp: LspManager,
+    pub lsp: std::sync::Arc<LspManager>,
     /// Registry snapshot; swapped by the background refresh (P2.5).
     /// Shared with `LspManager` (same Arc).
     pub registry: std::sync::Arc<tokio::sync::RwLock<Registry>>,
@@ -36,8 +36,10 @@ impl Server {
     pub fn new(config: Config) -> Self {
         let registry = std::sync::Arc::new(tokio::sync::RwLock::new(Registry::load()));
         spawn_registry_refresh(&config, registry.clone());
+        let lsp = std::sync::Arc::new(LspManager::new(config.clone(), registry.clone()));
+        spawn_idle_eviction(&config, &lsp);
         Self {
-            lsp: LspManager::new(config.clone(), registry.clone()),
+            lsp,
             store: Mutex::new(DocStore::new()),
             registry,
             jobs: std::sync::Arc::new(JobManager::new()),
@@ -95,6 +97,26 @@ impl Server {
         }
         logging::info("stdin closed; exiting");
     }
+}
+
+/// Start the idle client sweep (P2.10). Every minute, evict language
+/// clients unused past config.idle_evict_min. Zero disables the sweep.
+/// Detached; best effort; never blocks a tool call.
+fn spawn_idle_eviction(config: &Config, lsp: &std::sync::Arc<LspManager>) {
+    if config.idle_evict_min == 0 {
+        logging::info("idle eviction off");
+        return;
+    }
+    let idle_after = std::time::Duration::from_secs(config.idle_evict_min * 60);
+    let lsp = std::sync::Arc::clone(lsp);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let _ = lsp.evict_idle(idle_after).await;
+        }
+    });
 }
 
 /// Start the detached background registry refresh (P2.5 remainder, plan
