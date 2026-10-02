@@ -281,6 +281,22 @@ fn registry() -> &'static Vec<Tool> {
             deadline_kind: DeadlineKind::Read,
             run: run_search,
         },
+        Tool {
+            name: "symbols",
+            description: "Document symbols for one file (outline), or workspace symbol search by name. Uses the language server. Pass path for an outline; pass query to search names workspace-wide.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File for the document outline" },
+                    "query": { "type": "string", "description": "Name search across the workspace" },
+                    "max_results": { "type": "integer", "default": 200, "description": "Cap on returned symbols" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": []
+            }),
+            deadline_kind: DeadlineKind::Symbol,
+            run: run_symbols,
+        },
     ]
     })
 }
@@ -1285,4 +1301,241 @@ fn run_search(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             ),
         }))
     })
+}
+
+// ---------- Phase 2: symbols handler (P2.8) ----------
+
+/// `symbols`: documentSymbol outline for a path, or workspace/symbol name
+/// search. Results are capped; `next_offset` pages the workspace search.
+fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "symbols";
+        let max_results = arguments
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(crate::walker::MAX_MATCHES as u64)
+            .clamp(1, 500) as usize;
+        let raw_path = arg_str(&arguments, "path");
+        let query = arg_str(&arguments, "query");
+        if raw_path.is_none() && query.is_none() {
+            return Err(invalid(
+                tool,
+                "pass path for an outline, or query for name search",
+            ));
+        }
+
+        // Workspace-wide name search. The path picks the server.
+        if let Some(query) = query {
+            let raw = raw_path.expect("checked above");
+            let path = resolve_path(&server.config, &raw);
+            ensure_did_open(&server, &path).await?;
+            let Some((language, client)) = server.lsp.client_for_path(&path).await? else {
+                return missing_server(&server, &raw, &path).await;
+            };
+            let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);
+            let params = json!({ "query": query });
+            // Cold-start guard: a fresh server answers an empty list before
+            // it indexed the workspace. Poll within the deadline until the
+            // reply is non-empty (same trade-off as hover: a cold start can
+            // burn the budget; a warm server answers at once).
+            let start = std::time::Instant::now();
+            let mut result = client
+                .request("workspace/symbol", params.clone(), deadline)
+                .await;
+            loop {
+                let cold_empty =
+                    matches!(&result, Ok(v) if v.as_array().is_some_and(|a| a.is_empty()));
+                if !cold_empty || start.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                result = client
+                    .request("workspace/symbol", params.clone(), deadline)
+                    .await;
+            }
+            let result = result?;
+            let items = symbol_items(&result);
+            let total = items.len();
+            let page: Vec<Value> = items.into_iter().take(max_results).collect();
+            let truncated = total > page.len();
+            let next_offset = if truncated {
+                json!(max_results)
+            } else {
+                Value::Null
+            };
+            let text = if page.is_empty() {
+                "No symbols found.".to_string()
+            } else {
+                page.iter()
+                    .map(|s| symbol_entry_text(s, 0))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            return Ok(json!({
+                "language": language,
+                "symbols": page,
+                "count": page.len(),
+                "total": total,
+                "truncated": truncated,
+                "next_offset": next_offset,
+                "text": text,
+            }));
+        }
+
+        // Document outline.
+        let raw = raw_path.expect("checked above");
+        let path = resolve_path(&server.config, &raw);
+        ensure_did_open(&server, &path).await?;
+        let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);
+        let Some((language, client)) = server.lsp.client_for_path(&path).await? else {
+            return missing_server(&server, &raw, &path).await;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri_string(&path) }
+        });
+        let result = client
+            .request("textDocument/documentSymbol", params, deadline)
+            .await?;
+        let items = document_symbol_tree(&result, 0, max_results);
+        let text = if items.is_empty() {
+            "No symbols found.".to_string()
+        } else {
+            items
+                .iter()
+                .map(|s| s["entry"].as_str().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(json!({
+            "language": language,
+            "symbols": items,
+            "count": items.len(),
+            "text": text,
+        }))
+    })
+}
+
+/// Flatten a documentSymbol reply into one list. Servers answer with
+/// DocumentSymbol[] (nested children) or SymbolInformation[] (flat, location).
+/// Both forms are handled; entries carry a kind name, 1-based position, and a
+/// depth for indent rendering.
+fn document_symbol_tree(result: &Value, depth: usize, cap: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(nodes) = result.as_array() else {
+        return out;
+    };
+    for node in nodes {
+        if out.len() >= cap {
+            break;
+        }
+        let Some(name) = node.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        // documentSymbol form: range at the top level.
+        let start = node
+            .get("range")
+            .and_then(|r| r.get("start"))
+            // SymbolInformation form: location.range.start.
+            .or_else(|| {
+                node.get("location")
+                    .and_then(|l| l.get("range"))
+                    .and_then(|r| r.get("start"))
+            });
+        let line = start
+            .and_then(|s| s.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0)
+            + 1;
+        let column = start
+            .and_then(|s| s.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0)
+            + 1;
+        let kind = symbol_kind_name(node["kind"].as_u64().unwrap_or(0));
+        let entry = format!(
+            "{}{} {} {}:{}",
+            "  ".repeat(depth),
+            kind,
+            name,
+            line,
+            column
+        );
+        out.push(json!({
+            "name": name,
+            "kind": kind,
+            "line": line,
+            "column": column,
+            "depth": depth,
+            "entry": entry,
+        }));
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            let mut nested =
+                document_symbol_tree(&Value::Array(children.clone()), depth + 1, cap - out.len());
+            out.append(&mut nested);
+        }
+    }
+    out
+}
+
+/// One text line for a workspace/symbol item (SymbolInformation or
+/// WorkspaceSymbol, both carry name, kind, location).
+fn symbol_entry_text(item: &Value, depth: usize) -> String {
+    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let kind = symbol_kind_name(item["kind"].as_u64().unwrap_or(0));
+    let start = item
+        .get("location")
+        .and_then(|l| l.get("range"))
+        .and_then(|r| r.get("start"));
+    let line = start
+        .and_then(|s| s.get("line"))
+        .and_then(|l| l.as_u64())
+        .unwrap_or(0)
+        + 1;
+    let file = item
+        .get("location")
+        .and_then(|l| l.get("uri"))
+        .and_then(|u| u.as_str())
+        .and_then(|u| u.rsplit('/').next())
+        .map(|f| format!(" {f}:"))
+        .unwrap_or_default();
+    format!("{}{} {} {}{}", "  ".repeat(depth), kind, name, file, line)
+}
+
+/// Normalize a workspace/symbol reply to a symbol list. A null reply or a
+/// non-array body means no symbols.
+fn symbol_items(result: &Value) -> Vec<Value> {
+    result.as_array().cloned().unwrap_or_default()
+}
+
+/// LSP SymbolKind numbers to short names.
+fn symbol_kind_name(kind: u64) -> &'static str {
+    match kind {
+        1 => "file",
+        2 => "module",
+        3 => "namespace",
+        4 => "package",
+        5 => "class",
+        6 => "method",
+        7 => "property",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        15 => "string",
+        16 => "number",
+        17 => "boolean",
+        18 => "array",
+        19 => "object",
+        20 => "key",
+        21 => "null",
+        22 => "enum_member",
+        23 => "struct",
+        24 => "event",
+        25 => "operator",
+        26 => "type_parameter",
+        _ => "symbol",
+    }
 }

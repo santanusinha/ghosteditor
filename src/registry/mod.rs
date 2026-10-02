@@ -184,20 +184,59 @@ impl Registry {
         self.resolve_bin(recipe).is_some()
     }
 
-    /// Find the server binary: PATH first, then the install dir.
-    pub fn resolve_bin(&self, recipe: &Recipe) -> Option<std::path::PathBuf> {
-        let bin = recipe.bin.as_deref()?;
-        if let Ok(path_env) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_env) {
-                let candidate = dir.join(bin);
-                if candidate.is_file() {
-                    return Some(candidate);
+    /// Candidate binary names for a recipe. `bin` is the primary name. Two more
+    /// sources add candidates: the recipe name itself (toolchains ship the
+    /// server under it, e.g. rustup's rust-analyzer) and github asset file
+    /// names (ghostedit installs releases under them).
+    fn bin_names(recipe: &Recipe) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(bin) = recipe.bin.as_deref() {
+            names.push(bin.to_string());
+        }
+        names.push(recipe.name.clone());
+        for asset in &recipe.source.assets {
+            if let Some(bin) = asset.bin.as_deref() {
+                if let Some(file) = std::path::Path::new(bin)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                {
+                    names.push(file.to_string());
                 }
             }
         }
-        let root = install_root()?;
-        let installed = root.join(&recipe.name).join("bin").join(bin);
-        installed.is_file().then_some(installed)
+        names.dedup();
+        names
+    }
+
+    /// Find the server binary: the install dir first (what ghostedit
+    /// installed), then PATH. Same dir order for every name candidate.
+    pub fn resolve_bin(&self, recipe: &Recipe) -> Option<std::path::PathBuf> {
+        let names = Self::bin_names(recipe);
+        if names.is_empty() {
+            return None;
+        }
+        // The install dir wins over PATH: a binary ghostedit installed is the
+        // known-good one, and PATH can hold broken shims (e.g. a snap rustup
+        // shim that never serves LSP).
+        if let Some(root) = install_root() {
+            for name in &names {
+                let installed = root.join(&recipe.name).join("bin").join(name);
+                if installed.is_file() {
+                    return Some(installed);
+                }
+            }
+        }
+        if let Ok(path_env) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_env) {
+                for name in &names {
+                    let candidate = dir.join(name);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Full launch command for a recipe: resolved binary plus overlay args.

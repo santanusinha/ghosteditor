@@ -36,7 +36,7 @@ fn default_rename() -> u64 {
     8_000
 }
 fn default_symbol() -> u64 {
-    8_000
+    20_000
 }
 fn default_install() -> u64 {
     300_000
