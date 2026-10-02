@@ -22,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 lsp-types = "0.97"
-
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
 [dev-dependencies]
 tempfile = "3"
