@@ -265,6 +265,22 @@ fn registry() -> &'static Vec<Tool> {
             deadline_kind: DeadlineKind::Install,
             run: run_install_server,
         },
+        Tool {
+            name: "search",
+            description: "Search file contents across the workspace with the built-in walker. Literal (case-insensitive) or regex. Skips ignored and binary files. Capped at 200 matches; use next_offset to page.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Substring or regex pattern" },
+                    "regex": { "type": "boolean", "default": false, "description": "Treat query as a regex" },
+                    "offset": { "type": "integer", "default": 0, "description": "Skip the first N matches; pass next_offset to page" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["query"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_search,
+        },
     ]
     })
 }
@@ -1218,4 +1234,55 @@ fn internal(tool: &str, error: impl std::fmt::Display) -> ToolError {
         },
         tool,
     )
+}
+
+// ---------- Phase 2: search handler (P2.7) ----------
+
+/// `search`: run the walker in a blocking task so the async runtime stays
+/// responsive, inside the tool deadline set by the watchdog.
+fn run_search(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "search";
+        let query =
+            arg_str(&arguments, "query").ok_or_else(|| invalid(tool, "query is required"))?;
+        let regex = arguments
+            .get("regex")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let offset = arguments
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let root = server.config.cwd.clone();
+        let moved_query = query.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::walker::search(&root, &moved_query, regex, offset)
+        })
+        .await
+        .map_err(|e| internal(tool, format!("walker task failed: {e}")))?
+        .map_err(|e| invalid(tool, e))?;
+        let matches: Vec<Value> = result
+            .matches
+            .iter()
+            .map(|m| json!({ "path": m.path, "line": m.line, "column": m.column, "text": m.text }))
+            .collect();
+        let next_offset = if result.truncated {
+            json!(offset + result.matches.len())
+        } else {
+            Value::Null
+        };
+        Ok(json!({
+            "matches": matches,
+            "count": result.matches.len(),
+            "files_scanned": result.files_scanned,
+            "truncated": result.truncated,
+            "next_offset": next_offset,
+            "text": format!(
+                "{} matches across {} files{}",
+                result.matches.len(),
+                result.files_scanned,
+                if result.truncated { " (truncated; pass next_offset)" } else { "" }
+            ),
+        }))
+    })
 }
