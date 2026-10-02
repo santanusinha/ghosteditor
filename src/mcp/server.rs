@@ -102,7 +102,7 @@ async fn dispatch(
     request: Value,
 ) -> Option<Value> {
     match method {
-        "initialize" => Some(handle_initialize(&server, id)),
+        "initialize" => Some(handle_initialize(&server, id).await),
         "notifications/initialized" => None,
         "ping" => Some(ok_result(id, json!({}))),
         "tools/list" => Some(ok_result(id, json!({ "tools": tools::tool_list() }))),
@@ -114,8 +114,9 @@ async fn dispatch(
     }
 }
 
-/// `initialize`: server info plus the deadline table (S8, P0.3).
-fn handle_initialize(server: &Server, id: Option<Value>) -> Value {
+/// `initialize`: server info, the deadline table (S8, P0.3), and the
+/// language-server status table (P2.6e).
+async fn handle_initialize(server: &Server, id: Option<Value>) -> Value {
     let mut info = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
@@ -131,6 +132,17 @@ fn handle_initialize(server: &Server, id: Option<Value>) -> Value {
         "workspace": server.config.cwd.display().to_string(),
         "deadlines": server.config.deadline_table(),
     });
+    // The registry view: pin, counts, and per-language status (P2.6e). The
+    // read guard is held only inside this block; nothing is awaited here.
+    {
+        let registry = server.registry.read().await;
+        info["ghostedit"]["servers"] = json!({
+            "registry_pin": registry.pin,
+            "recipes": registry.recipes.len(),
+            "installable": registry.recipes.iter().filter(|r| r.supported).count(),
+            "languages": registry_languages(&registry),
+        });
+    }
     ok_result(id, info)
 }
 
@@ -202,6 +214,23 @@ async fn handle_tools_call(
     } else {
         error_result(id, -32602, &format!("unknown tool: {name}"))
     }
+}
+
+/// The per-language server status map for initialize (P2.6e). One entry per
+/// overlay language, with its probe status.
+fn registry_languages(registry: &crate::registry::Registry) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for recipe in &registry.recipes {
+        let Some(overlay) = &recipe.overlay else {
+            continue;
+        };
+        let language = &overlay.language;
+        if map.contains_key(language) {
+            continue;
+        }
+        map.insert(language.clone(), json!(registry.status_for(language)));
+    }
+    serde_json::Value::Object(map)
 }
 
 fn call_content(value: Value) -> Value {
