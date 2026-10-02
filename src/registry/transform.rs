@@ -28,7 +28,7 @@ pub struct OverlayEntry {
     pub supported: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Snapshot {
     pub pin: String,
     pub generated: String,

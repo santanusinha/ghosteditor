@@ -127,6 +127,7 @@ impl LspManager {
     /// 1. config entry for the language the config maps the extension to
     /// 2. registry recipe for the extension: `bin` on PATH, then in the
     ///    install dir (launch args from the overlay)
+    ///
     /// The registry fills gaps; it never overrides explicit config.
     pub async fn client_for_path(
         &self,

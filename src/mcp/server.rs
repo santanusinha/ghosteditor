@@ -35,6 +35,7 @@ pub struct Server {
 impl Server {
     pub fn new(config: Config) -> Self {
         let registry = std::sync::Arc::new(tokio::sync::RwLock::new(Registry::load()));
+        spawn_registry_refresh(&config, registry.clone());
         Self {
             lsp: LspManager::new(config.clone(), registry.clone()),
             store: Mutex::new(DocStore::new()),
@@ -94,6 +95,49 @@ impl Server {
         }
         logging::info("stdin closed; exiting");
     }
+}
+
+/// Start the detached background registry refresh (P2.5 remainder, plan
+/// section 8). The fetch runs under a hard cap; any failure keeps the
+/// embedded snapshot or cache already loaded. Silent fallback, one log line.
+fn spawn_registry_refresh(
+    config: &Config,
+    registry: std::sync::Arc<tokio::sync::RwLock<Registry>>,
+) {
+    use crate::config::RefreshMode;
+    let (tag, mode) = match &config.registry.refresh {
+        RefreshMode::Off => {
+            logging::info("registry refresh off; keeping the loaded snapshot");
+            return;
+        }
+        RefreshMode::Pinned => {
+            let Some(pin) = config.registry.pin.clone() else {
+                logging::info("registry refresh pinned but no pin; skipping");
+                return;
+            };
+            (pin, "pinned")
+        }
+        RefreshMode::Latest => ("latest".to_string(), "latest"),
+        RefreshMode::Unknown => ("latest".to_string(), "latest"),
+    };
+    tokio::spawn(async move {
+        let fetch = crate::registry::refresh::refresh(&tag);
+        match tokio::time::timeout(Duration::from_secs(60), fetch).await {
+            Ok(Ok(fresh)) => {
+                let pin = fresh.pin.clone();
+                *registry.write().await = fresh;
+                logging::info(format!("registry refreshed from mason tag {pin} ({mode})"));
+            }
+            Ok(Err(error)) => {
+                logging::info(format!(
+                    "registry refresh failed; keeping the snapshot: {error}"
+                ));
+            }
+            Err(_) => {
+                logging::info("registry refresh timed out after 60s; keeping the snapshot");
+            }
+        }
+    });
 }
 
 /// Route one message. Returns a response to send, or None for notifications.

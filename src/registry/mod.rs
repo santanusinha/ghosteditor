@@ -15,6 +15,7 @@
 
 pub mod install;
 pub mod jobs;
+pub mod refresh;
 pub mod transform;
 
 use serde::{Deserialize, Serialize};

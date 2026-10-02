@@ -68,6 +68,44 @@ pub struct Language {
     pub deadlines_ms: Option<Deadlines>,
 }
 
+/// The background registry refresh mode (plan-registry section 8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum RefreshMode {
+    /// Fetch the newest mason release (the default).
+    #[serde(rename = "latest")]
+    Latest,
+    /// Fetch only the tag in `RegistrySettings::pin`.
+    #[serde(rename = "pinned")]
+    Pinned,
+    /// Never fetch; use the cache or the embedded snapshot.
+    #[serde(rename = "off")]
+    Off,
+    /// An absent `[registry]` table: behave as `latest`.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `[registry]` config table (P2.5 remainder).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegistrySettings {
+    /// Refresh mode: `latest` (default), `pinned`, or `off`.
+    #[serde(default)]
+    pub refresh: RefreshMode,
+    /// The mason release tag to fetch when `refresh = "pinned"`.
+    #[serde(default)]
+    pub pin: Option<String>,
+}
+
+impl Default for RegistrySettings {
+    fn default() -> Self {
+        Self {
+            refresh: RefreshMode::Latest,
+            pin: None,
+        }
+    }
+}
+
 /// The merged, effective configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -76,15 +114,18 @@ pub struct Config {
     pub global_path: PathBuf,
     pub languages: BTreeMap<String, Language>,
     pub defaults: Deadlines,
+    pub registry: RegistrySettings,
 }
 
-/// Raw file layout; languages is the only table.
+/// Raw file layout; languages is the main table.
 #[derive(Debug, Default, Deserialize)]
 struct Raw {
     #[serde(default)]
     languages: BTreeMap<String, Language>,
     #[serde(default)]
     defaults_ms: Option<Deadlines>,
+    #[serde(default)]
+    registry: Option<RegistrySettings>,
 }
 
 impl Config {
@@ -108,10 +149,14 @@ impl Config {
 
         let mut languages = BTreeMap::new();
         let mut defaults = Deadlines::default();
+        let mut registry = RegistrySettings::default();
 
         if let Some(raw) = read_raw(&global_path).await {
             if let Some(merged_defaults) = raw.defaults_ms {
                 defaults = merged_defaults;
+            }
+            if let Some(merged_registry) = raw.registry {
+                registry = merged_registry;
             }
             languages = raw.languages;
         }
@@ -120,6 +165,11 @@ impl Config {
         if let Some(raw) = read_raw(&project_path).await {
             if let Some(merged_defaults) = raw.defaults_ms {
                 defaults = merged_defaults;
+            }
+            // The project `[registry]` table replaces the global one whole;
+            // it does not merge field by field (the same rule as languages).
+            if let Some(merged_registry) = raw.registry {
+                registry = merged_registry;
             }
             for (name, entry) in raw.languages {
                 languages.insert(name, entry); // Full replace, per decision 9.5.
@@ -132,6 +182,7 @@ impl Config {
             global_path,
             languages,
             defaults,
+            registry,
         })
     }
 
@@ -233,6 +284,7 @@ mod tests {
             global_path: PathBuf::from("/tmp/none.toml"),
             languages,
             defaults: Deadlines::default(),
+            registry: RegistrySettings::default(),
         };
         let (name, entry) = config.language_for(Path::new("/a/main.py")).unwrap();
         assert_eq!(name, "python");
@@ -263,6 +315,7 @@ mod tests {
             global_path: PathBuf::from("/tmp/none.toml"),
             languages,
             defaults: Deadlines::default(),
+            registry: RegistrySettings::default(),
         };
         let d = config.deadlines_for("java");
         assert_eq!(d.read, 5_000);
@@ -272,5 +325,39 @@ mod tests {
         // An unknown language falls back to the defaults.
         let fallback = config.deadline_table()["languages"]["java"].clone();
         assert!(fallback.is_object());
+    }
+}
+
+#[cfg(test)]
+mod registry_config_tests {
+    use super::*;
+
+    fn parse(text: &str) -> Option<RegistrySettings> {
+        toml::from_str::<Raw>(text)
+            .ok()
+            .and_then(|raw| raw.registry)
+    }
+
+    #[test]
+    fn registry_table_parses_all_modes() {
+        assert_eq!(
+            parse("[registry]\nrefresh = \"off\"\n").unwrap().refresh,
+            RefreshMode::Off
+        );
+        assert_eq!(
+            parse("[registry]\nrefresh = \"pinned\"\npin = \"2026-10-02-uppity-comic\"\n")
+                .unwrap()
+                .pin
+                .as_deref(),
+            Some("2026-10-02-uppity-comic")
+        );
+        // Defaults: absent table behaves as latest; unknown value falls back.
+        assert_eq!(RegistrySettings::default().refresh, RefreshMode::Latest);
+        assert_eq!(
+            parse("[registry]\nrefresh = \"nonsense\"\n")
+                .unwrap()
+                .refresh,
+            RefreshMode::Unknown
+        );
     }
 }
