@@ -396,9 +396,26 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             "position": { "line": line - 1, "character": column - 1 },
             "newName": new_name
         });
-        let result = client
-            .request("textDocument/rename", params, deadline)
-            .await?;
+        let mut result = client
+            .request("textDocument/rename", params.clone(), deadline)
+            .await;
+        // Cold-start guard: a fresh server often answers -32602 before it
+        // finished analysis. Wait for the first diagnostics push, then
+        // retry once (the same pattern as the position tools).
+        if is_cold_refusal(&result) {
+            let mut waited = 0u64;
+            while waited < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                waited += 500;
+                if let Some(pushed) = client.diagnostics_for(&path).await {
+                    if !pushed.diagnostics.is_empty() {
+                        break;
+                    }
+                }
+            }
+            result = client.request("textDocument/rename", params, deadline).await;
+        }
+        let result = result?;
         let workspace_edit = match result.as_object() {
             Some(object) => object.clone(),
             None => {
@@ -1010,6 +1027,18 @@ async fn nudge_position(
         }
     }
     None
+}
+
+/// True when the server refused with a no-references style error, which
+/// on a cold start usually means "not analyzed yet".
+fn is_cold_refusal(result: &Result<Value, ToolError>) -> bool {
+    match result {
+        Ok(_) => false,
+        Err(error) => {
+            let message = error.to_string();
+            message.contains("No references found") || message.contains("-32602")
+        }
+    }
 }
 
 fn hover_is_empty(result: &Value) -> bool {

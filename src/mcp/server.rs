@@ -42,15 +42,22 @@ impl Server {
         let stdout = tokio::io::stdout();
         let mut writer = stdout;
 
+        let mut ndjson = false;
         loop {
             let message = match read_message(&mut reader).await {
-                Ok(Some(message)) => message,
+                Ok(Some((message, client_ndjson))) => {
+                    if client_ndjson {
+                        ndjson = true;
+                    }
+                    message
+                }
                 Ok(None) => break, // stdin closed: clean exit
                 Err(error) => {
                     logging::info(format!("stdin read failed: {error}"));
                     break;
                 }
             };
+
             let request: Value = match serde_json::from_slice(&message) {
                 Ok(value) => value,
                 Err(error) => {
@@ -66,11 +73,13 @@ impl Server {
                 .unwrap_or("")
                 .to_string();
 
-            let response = dispatch(server.clone(), id, &method, request).await;
-            if let Some(response) = response {
-                if write_message(&mut writer, &response).await.is_err() {
-                    break;
+            match dispatch(server.clone(), id, &method, request).await {
+                Some(response) => {
+                    if write_message(&mut writer, &response, ndjson).await.is_err() {
+                        break;
+                    }
                 }
+                None => continue,
             }
         }
         logging::info("stdin closed; exiting");
@@ -211,15 +220,64 @@ fn error_result(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
-/// Read one Content-Length framed message. None means EOF.
+/// Read one message. Accepts both MCP wire formats:
+/// Content-Length framing and newline-delimited JSON (NDJSON). None means
+/// EOF. The first byte decides: `{` starts an NDJSON line, `C`/`c` starts
+/// a header.
 async fn read_message<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<Option<Vec<u8>>, std::io::Error> {
-    // Parse headers until the blank line.
+) -> Result<Option<(Vec<u8>, bool)>, std::io::Error> {
+    // Read the first byte of the line.
+    let mut first = [0u8; 1];
+    loop {
+        match reader.read(&mut first).await? {
+            0 => return Ok(None),
+            _ if first[0] == b'\n' || first[0] == b'\r' => continue, // blank line
+            _ => break,
+        }
+    }
+    if first[0] == b'{' {
+        // NDJSON: read the rest of the line.
+        let mut body = vec![first[0]];
+        let mut byte = [0u8; 1];
+        loop {
+            let n = reader.read(&mut byte).await?;
+            if n == 0 {
+                return Ok(Some((body, true)));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            body.push(byte[0]);
+        }
+        return Ok(Some((body, true)));
+    }
+
+    // Content-Length framing: the first byte starts the header line.
+    let mut header = vec![first[0]];
     let mut content_length: Option<usize> = None;
+    // Finish the current header line.
+    loop {
+        let mut byte = [0u8; 1];
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        header.push(byte[0]);
+    }
+    let header = String::from_utf8_lossy(&header).trim().to_string();
+    if let Some(value) = header
+        .strip_prefix("Content-Length:")
+        .or_else(|| header.strip_prefix("content-length:"))
+    {
+        content_length = value.trim().parse::<usize>().ok();
+    }
+    // Further headers until the blank line.
     loop {
         let mut line = Vec::new();
-        // Read one byte at a time until \n. Headers are tiny.
         loop {
             let mut byte = [0u8; 1];
             let n = reader.read(&mut byte).await?;
@@ -231,7 +289,7 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
             }
             line.push(byte[0]);
         }
-        let line = String::from_utf8_lossy(&line).trim_end().to_string();
+        let line = String::from_utf8_lossy(&line).trim().to_string();
         if line.is_empty() {
             break;
         }
@@ -253,19 +311,25 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
     };
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).await?;
-    Ok(Some(body))
+    Ok(Some((body, false)))
 }
 
-/// Write one framed message.
+/// Write one message in the client's wire format.
 async fn write_message<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     value: &Value,
+    ndjson: bool,
 ) -> Result<(), std::io::Error> {
     let body = serde_json::to_vec(value)?;
-    writer
-        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-        .await?;
-    writer.write_all(&body).await?;
+    if ndjson {
+        writer.write_all(&body).await?;
+        writer.write_all(b"\n").await?;
+    } else {
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await?;
+        writer.write_all(&body).await?;
+    }
     writer.flush().await?;
     Ok(())
 }
@@ -278,10 +342,10 @@ mod tests {
     async fn framing_round_trips() {
         let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": { "ok": true } });
         let mut buffer = Vec::new();
-        write_message(&mut buffer, &payload).await.unwrap();
+        write_message(&mut buffer, &payload, false).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(buffer);
-        let message = read_message(&mut cursor).await.unwrap().unwrap();
+        let (message, _ndjson) = read_message(&mut cursor).await.unwrap().unwrap();
         let parsed: Value = serde_json::from_slice(&message).unwrap();
         assert_eq!(parsed["result"]["ok"], json!(true));
     }
