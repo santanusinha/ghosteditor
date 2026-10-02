@@ -551,18 +551,66 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
     })
 }
 
-/// Open the document in the DocStore and send didOpen to the server (P1.4).
+/// Open the document in the DocStore and sync it to the server (P1.4, P2.9).
+///
+/// First didOpen sends the text. After that, a reload from disk (external
+/// edit) sends didChange with the full new text, because the server keeps
+/// its own copy of an open document and ignores the disk copy (P2.9).
 async fn ensure_did_open(server: &Arc<Server>, path: &Path) -> Result<(), ToolError> {
-    let text = {
+    let (text, reloaded) = {
         let mut store = server.store.lock().await;
-        store.open(path).await.map_err(|e| internal("open", e))?;
-        store.text(path)
+        let facts = store.open(path).await.map_err(|e| internal("open", e))?;
+        let Some(text) = store.text(path) else {
+            return Ok(());
+        };
+        (text, facts.reloaded)
     };
-    let Some(text) = text else { return Ok(()) };
+    if reloaded {
+        // Sync outside the store lock (sync_after_reload takes it).
+        sync_after_reload(server, path, &text).await;
+    }
     if let Some((language, client)) = server.lsp.client_for_path(path).await? {
-        client.did_open_once(path, &language, &text).await;
+        client.did_open_or_change(&language, path, &text).await;
     }
     Ok(())
+}
+
+/// Push a disk-reloaded document text to the server (P2.9). For a doc the
+/// server already opened, sends didChange with the full text. For any doc,
+/// also notifies workspace/didChangeWatchedFiles when the server supports
+/// it, so unopened docs re-analyze. Both are best effort.
+async fn sync_after_reload(server: &Arc<Server>, path: &Path, text: &str) {
+    let Some((_language, client)) = server.lsp.try_client_for_path(path).await else {
+        return;
+    };
+    client.did_open_or_change("", path, text).await;
+    if client.supports("workspace/didChangeWatchedFiles").await {
+        if let Some(uri) = file_uri_of(path) {
+            client
+                .did_change_watched_files(vec![lsp_types::FileEvent {
+                    uri,
+                    typ: lsp_types::FileChangeType::CHANGED,
+                }])
+                .await;
+        }
+    }
+}
+
+/// Push an edit made by ghostedit itself to the server (P2.9). The file was
+/// already open in the store and the server, so didChange with the full
+/// text is the whole job.
+async fn sync_after_edit(server: &Arc<Server>, path: &Path, text: &str) {
+    if let Some((_language, client)) = server.lsp.try_client_for_path(path).await {
+        client.did_open_or_change("", path, text).await;
+    }
+}
+
+/// file:// URI for a path, mirroring the LspClient's own scheme.
+fn file_uri_of(path: &Path) -> Option<lsp_types::Uri> {
+    use std::str::FromStr;
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let uri = format!("file://{}", absolute.display());
+    lsp_types::Uri::from_str(&uri).ok()
 }
 
 /// The effective deadline for a call, honoring per-server overrides.
@@ -1013,6 +1061,10 @@ fn run_edit_lines(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                 .await
                 .map_err(|e| internal(tool, e))?;
             store.saved(&path).await.map_err(|e| internal(tool, e))?;
+            // Sync the edit to the server (P2.9). The store lock is held
+            // during the write, so drop it around the async sync.
+            drop(store);
+            sync_after_edit(&server, &path, &new_text).await;
             Some(outcome_kind)
         } else {
             None
@@ -1080,11 +1132,15 @@ fn run_edit_text(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                     .ok_or_else(|| internal(tool, "document missing"))?;
                 document.text = replaced;
                 document.version += 1;
+                let saved_text = document.text.clone();
                 if save {
-                    write_atomic(&path, &document.text)
+                    write_atomic(&path, &saved_text)
                         .await
                         .map_err(|e| internal(tool, e))?;
                     store.saved(&path).await.map_err(|e| internal(tool, e))?;
+                    // Sync the edit to the server (P2.9).
+                    drop(store);
+                    sync_after_edit(&server, &path, &saved_text).await;
                 }
                 let line = 1 + current[..from].matches('\n').count();
                 Ok(json!({
@@ -1097,19 +1153,71 @@ fn run_edit_text(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                     "warnings": 0,
                 }))
             }
-            count => Err(ToolError::new(
-                ErrorKind::Invalid {
-                    hint: format!(
-                        "{count} matches. add more context to old_text, or set replace_all"
-                    ),
-                },
-                tool,
-            )),
+            count => {
+                // The outer store guard is still held here; every store
+                // use below re-locks, so drop it first (tokio Mutex is
+                // not reentrant).
+                drop(store);
+                let from = found[0].0;
+                // Byte offsets shift after each replacement; apply in
+                // reverse order so earlier offsets stay valid.
+                let replaced = {
+                    let mut text = current.clone();
+                    for (from, to) in found.iter().rev() {
+                        text.replace_range(from..to, &new_text);
+                    }
+                    text
+                };
+                let line = 1 + current[..from].matches('\n').count();
+                if !replace_all {
+                    return Err(ToolError::new(
+                        ErrorKind::Invalid {
+                            hint: format!(
+                                "{count} matches. add more context to old_text, or set replace_all. first match at line {line}"
+                            ),
+                        },
+                        tool,
+                    ));
+                }
+                if save {
+                    let saved_text = {
+                        let mut store = server.store.lock().await;
+                        store.open(&path).await.map_err(|e| internal(tool, e))?;
+                        let Some(document) = store.document_mut(&path) else {
+                            return Err(internal(tool, "document missing"));
+                        };
+                        document.text = replaced.clone();
+                        document.version += 1;
+                        write_atomic(&path, &replaced)
+                            .await
+                            .map_err(|e| internal(tool, e))?;
+                        store.saved(&path).await.map_err(|e| internal(tool, e))?;
+                        replaced.clone()
+                    };
+                    // Sync the edit to the server (P2.9). Outside the lock.
+                    sync_after_edit(&server, &path, &saved_text).await;
+                } else {
+                    let mut store = server.store.lock().await;
+                    store.open(&path).await.map_err(|e| internal(tool, e))?;
+                    if let Some(document) = store.document_mut(&path) {
+                        document.text = replaced.clone();
+                        document.version += 1;
+                    }
+                }
+                Ok(json!({
+                    "text": format!("Replaced {count} matches. saved={save}"),
+                    "path": path.display().to_string(),
+                    "replacements": count,
+                    "line": line,
+                    "saved": save,
+                    "errors": 0,
+                    "warnings": 0,
+                }))
+            }
         }
     })
 }
 
-/// Byte ranges of whole-line matches, whitespace-tolerant (P0.13).
 /// Byte ranges of whole-line matches, whitespace-tolerant (P0.13).
 fn find_matches(haystack: &str, needle: &str, _all: bool) -> Vec<(usize, usize)> {
     // Tier 1: exact. Tier 2: trailing-whitespace-insensitive per line.

@@ -180,6 +180,34 @@ impl LspManager {
         self.client_for_command(&language, command).await
     }
 
+    /// The existing client for a path when already spawned; None otherwise.
+    /// Never spawns (P2.9). Mirrors the probe order of client_for_path.
+    pub async fn try_client_for_path(&self, path: &Path) -> Option<(String, Arc<LspClient>)> {
+        if let Some((language, _)) = self.config.language_for(path) {
+            let client = self.clients.lock().await.get(&language).cloned();
+            return client.map(|client| (language, client));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))?;
+        let registry = self.registry.read().await;
+        let recipes = registry.recipes_for_extension(&ext);
+        let is_default = |r: &&crate::registry::Recipe| {
+            r.supported
+                && r.overlay
+                    .as_ref()
+                    .is_some_and(|o| o.default_for.iter().any(|e| e == &ext))
+        };
+        let language = recipes
+            .iter()
+            .position(is_default)
+            .or_else(|| recipes.iter().position(|r| r.supported))
+            .and_then(|i| recipes[i].overlay.as_ref().map(|o| o.language.clone()))?;
+        let client = self.clients.lock().await.get(&language).cloned();
+        client.map(|client| (language, client))
+    }
+
     /// Spawn (or reuse) a client for a language with an explicit command.
     /// Mirrors `client_for`, but the command comes from the registry.
     async fn client_for_command(

@@ -60,6 +60,8 @@ pub struct LspClient {
     inner: Arc<Inner>,
     /// Documents already opened: didOpen must be sent exactly once.
     opened: Mutex<std::collections::HashSet<String>>,
+    /// The last didChange version sent per document (P2.9).
+    opened_versions: Mutex<std::collections::HashMap<String, i32>>,
 }
 
 impl LspClient {
@@ -136,6 +138,7 @@ impl LspClient {
         let client = Self {
             inner,
             opened: Mutex::new(std::collections::HashSet::new()),
+            opened_versions: Mutex::new(std::collections::HashMap::new()),
         };
         crate::util::logging::debug("lsp: spawned, sending initialize");
         client.initialize(root, initialization_options).await?;
@@ -242,7 +245,35 @@ impl LspClient {
     }
 
     /// Send a request and wait with a deadline. A late reply is dropped.
+    /// A ContentModified reply (-32801) is retried inside the deadline:
+    /// the server reports it when the document text changed during the
+    /// analysis pass, and the new pass answers with fresh data (P2.9).
     pub async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        deadline_ms: u64,
+    ) -> Result<Value, ToolError> {
+        let started = std::time::Instant::now();
+        loop {
+            let result = self.request_once(method, params.clone(), deadline_ms).await;
+            if !is_content_modified(&result) {
+                return result;
+            }
+            let elapsed = started.elapsed().as_millis() as u64;
+            if elapsed >= deadline_ms {
+                return result;
+            }
+            // The re-analysis pass is fast; poll without burning the budget.
+            let wait = std::time::Duration::from_millis(100).min(std::time::Duration::from_millis(
+                deadline_ms.saturating_sub(elapsed),
+            ));
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// One request attempt, no retry.
+    async fn request_once(
         &self,
         method: &str,
         params: Value,
@@ -308,14 +339,29 @@ impl LspClient {
         let _ = self.inner.writer.send(line).await;
     }
 
-    /// didOpen once per document; later calls are no-ops (P1.4).
-    pub async fn did_open_once(&self, path: &Path, language_id: &str, text: &str) {
+    /// didOpen a document exactly once; later calls send didChange with
+    /// the full text instead (P2.9). This is the single sync point: the
+    /// server keeps its own copy of an open doc, so every text change
+    /// rides along as full-text didChange. Version grows from 1.
+    pub async fn did_open_or_change(&self, language_id: &str, path: &Path, text: &str) {
         let key = uri_string_of(path);
-        if self.opened.lock().await.contains(&key) {
-            return;
+        let (first, version) = {
+            let opened = self.opened.lock().await;
+            if opened.contains(&key) {
+                let last = *self.opened_versions.lock().await.get(&key).unwrap_or(&1);
+                (false, last + 1)
+            } else {
+                (true, 1)
+            }
+        };
+        if first {
+            self.did_open(path, language_id, text, 1).await;
+            self.opened.lock().await.insert(key.clone());
+            self.opened_versions.lock().await.insert(key, 1);
+        } else {
+            self.opened_versions.lock().await.insert(key, version);
+            self.did_change(path, text, version).await;
         }
-        self.did_open(path, language_id, text, 1).await;
-        self.opened.lock().await.insert(key);
     }
 
     /// didOpen a document so the server starts analyzing it (P1.4).
@@ -339,8 +385,10 @@ impl LspClient {
         .await;
     }
 
-    /// didChange with full text sync (v1; incremental arrives later).
-    #[allow(dead_code)]
+    /// didChange with full text sync. Sent after a disk reload of an
+    /// already-open doc and after ghostedit's own edits (P2.9). The
+    /// server keeps its own copy of an open doc, so the text must ride
+    /// along; a bare workspace/didChangeWatchedFiles is not enough.
     pub async fn did_change(&self, path: &Path, text: &str, version: i32) {
         let uri = match file_uri(path) {
             Some(uri) => uri,
@@ -378,6 +426,16 @@ impl LspClient {
         .await;
     }
 
+    /// workspace/didChangeWatchedFiles for external disk changes (P2.9).
+    pub async fn did_change_watched_files(&self, changes: Vec<lsp_types::FileEvent>) {
+        let params = lsp_types::DidChangeWatchedFilesParams { changes };
+        self.notify(
+            lsp_types::notification::DidChangeWatchedFiles::METHOD,
+            serde_json::to_value(params).unwrap(),
+        )
+        .await;
+    }
+
     /// The latest diagnostics pushed for one document (P1.5).
     pub async fn diagnostics_for(&self, path: &Path) -> Option<PublishDiagnosticsParams> {
         let uri = file_uri(path)?;
@@ -389,6 +447,17 @@ impl LspClient {
     pub async fn shutdown(&self) {
         let _ = self.request("shutdown", json!({}), 2_000).await;
         self.notify("exit", json!({})).await;
+    }
+}
+
+/// True when the reply is a ContentModified error (-32801): the document
+/// changed during the analysis pass, so the answer is stale on arrival
+/// (P2.9). rust-analyzer sends this after every didChange that lands
+/// while an analysis runs.
+fn is_content_modified(result: &Result<Value, ToolError>) -> bool {
+    match result {
+        Err(error) => error.to_string().contains("-32801"),
+        _ => false,
     }
 }
 
@@ -474,16 +543,27 @@ async fn reader_task(inner: Arc<Inner>, stdout: tokio::process::ChildStdout) {
         };
 
         if let Some(id) = message.get("id").and_then(|v| v.as_u64()) {
-            crate::util::logging::debug(format!("lsp: response id={id}"));
-            // A response to one of our requests.
-            if let Some(pending) = inner.pending.lock().await.remove(&id) {
-                if let Some(error) = message.get("error") {
-                    let _ = pending.reply.send(Err(error.to_string()));
-                } else {
-                    let _ = pending
-                        .reply
-                        .send(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
+            crate::util::logging::debug(format!(
+                "lsp: response id={id} error={}",
+                message.get("error").is_some()
+            ));
+            // A response to one of our requests. A server request also
+            // carries an id but also a method; it is not a reply.
+            if message.get("method").is_none() {
+                if let Some(pending) = inner.pending.lock().await.remove(&id) {
+                    if let Some(error) = message.get("error") {
+                        let _ = pending.reply.send(Err(error.to_string()));
+                    } else {
+                        let _ = pending
+                            .reply
+                            .send(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
+                    }
                 }
+            } else {
+                // A server->client request. Answer nothing; servers that
+                // wait on a reply would hang. window/workDoneProgress and
+                // workspace/configuration are the usual ones.
+                crate::util::logging::debug("lsp: server request (no reply sent)");
             }
         } else if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
             if method == PublishDiagnostics::METHOD {
