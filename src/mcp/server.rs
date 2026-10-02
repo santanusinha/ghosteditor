@@ -26,17 +26,19 @@ pub struct Server {
     pub store: Mutex<DocStore>,
     pub lsp: LspManager,
     /// Registry snapshot; swapped by the background refresh (P2.5).
-    pub registry: tokio::sync::RwLock<Registry>,
+    /// Shared with `LspManager` (same Arc).
+    pub registry: std::sync::Arc<tokio::sync::RwLock<Registry>>,
     /// Install job table (P2.6b).
     pub jobs: std::sync::Arc<JobManager>,
 }
 
 impl Server {
     pub fn new(config: Config) -> Self {
+        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(Registry::load()));
         Self {
-            lsp: LspManager::new(config.clone()),
+            lsp: LspManager::new(config.clone(), registry.clone()),
             store: Mutex::new(DocStore::new()),
-            registry: tokio::sync::RwLock::new(Registry::load()),
+            registry,
             jobs: std::sync::Arc::new(JobManager::new()),
             config,
         }

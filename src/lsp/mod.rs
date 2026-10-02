@@ -11,11 +11,14 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::lsp::client::LspClient;
+use crate::registry::Registry;
 use crate::util::ToolError;
 
 /// Manages one client per language. Spawn on first use.
 pub struct LspManager {
     config: Config,
+    /// Registry fallback when the config has no entry for a path (P2.6f).
+    registry: std::sync::Arc<tokio::sync::RwLock<Registry>>,
     clients: Mutex<HashMap<String, Arc<LspClient>>>,
     /// Spawn-in-progress guards so two tools do not spawn twice.
     spawning: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -29,9 +32,10 @@ const RESTART_CAP: u32 = 3;
 const RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl LspManager {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, registry: std::sync::Arc<tokio::sync::RwLock<Registry>>) -> Self {
         Self {
             config,
+            registry,
             clients: Mutex::new(HashMap::new()),
             spawning: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
@@ -119,18 +123,94 @@ impl LspManager {
         Ok(Some(client))
     }
 
-    /// The language for a path, then the client for it.
+    /// The client for a path. Probe order (P2.6f):
+    /// 1. config entry for the language the config maps the extension to
+    /// 2. registry recipe for the extension: `bin` on PATH, then in the
+    ///    install dir (launch args from the overlay)
+    /// The registry fills gaps; it never overrides explicit config.
     pub async fn client_for_path(
         &self,
         path: &Path,
     ) -> Result<Option<(String, Arc<LspClient>)>, ToolError> {
-        let language = match self.config.language_for(path) {
-            Some((name, _)) => name,
-            None => return Ok(None),
-        };
-        match self.client_for(&language).await? {
-            Some(client) => Ok(Some((language, client))),
-            None => Ok(None),
+        // 1. Explicit config.
+        if let Some((language, _)) = self.config.language_for(path) {
+            return match self.client_for(&language).await? {
+                Some(client) => Ok(Some((language, client))),
+                None => Ok(None),
+            };
         }
+        // 2. Registry fallback.
+        let Some(ext) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+        else {
+            return Ok(None);
+        };
+        // Read guard only for the lookup; clone the recipe and its launch
+        // command out in the same block. Nothing is awaited while held.
+        let resolved = {
+            let registry = self.registry.read().await;
+            let recipes = registry.recipes_for_extension(&ext);
+            let is_default = |r: &&crate::registry::Recipe| {
+                r.supported
+                    && r.overlay
+                        .as_ref()
+                        .is_some_and(|o| o.default_for.iter().any(|e| e == &ext))
+            };
+            let index = recipes
+                .iter()
+                .position(is_default)
+                .or_else(|| recipes.iter().position(|r| r.supported));
+            index.map(|i| {
+                let recipe = recipes[i].clone();
+                let command = registry.launch_command(recipes[i]);
+                (recipe, command)
+            })
+        };
+        let Some((recipe, Some(command))) = resolved else {
+            return Ok(None);
+        };
+        let language = recipe
+            .overlay
+            .as_ref()
+            .map(|o| o.language.clone())
+            .unwrap_or_else(|| recipe.name.clone());
+        self.client_for_command(&language, command).await
+    }
+
+    /// Spawn (or reuse) a client for a language with an explicit command.
+    /// Mirrors `client_for`, but the command comes from the registry.
+    async fn client_for_command(
+        &self,
+        language: &str,
+        command: Vec<String>,
+    ) -> Result<Option<(String, Arc<LspClient>)>, ToolError> {
+        if let Some(client) = self.clients.lock().await.get(language) {
+            if !client.is_dead() {
+                return Ok(Some((language.to_string(), client.clone())));
+            }
+            self.clients.lock().await.remove(language);
+        }
+        // One spawner at a time per language.
+        let guard_key = language.to_string();
+        let guard = {
+            let mut guards = self.spawning.lock().await;
+            guards
+                .entry(guard_key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _lock = guard.lock().await;
+        if let Some(client) = self.clients.lock().await.get(language) {
+            return Ok(Some((language.to_string(), client.clone())));
+        }
+        let client = LspClient::spawn(&command, &self.config.cwd, None).await?;
+        let client = Arc::new(client);
+        self.clients
+            .lock()
+            .await
+            .insert(language.to_string(), client.clone());
+        Ok(Some((language.to_string(), client)))
     }
 }

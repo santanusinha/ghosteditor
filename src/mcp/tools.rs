@@ -489,10 +489,8 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             while waited < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 waited += 500;
-                if let Some(pushed) = client.diagnostics_for(&path).await {
-                    if !pushed.diagnostics.is_empty() {
-                        break;
-                    }
+                if client.diagnostics_for(&path).await.is_some() {
+                    break;
                 }
             }
             result = client
@@ -651,10 +649,10 @@ async fn lsp_position_call(
         while waited < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             waited += 500;
-            if let Some(pushed) = client.diagnostics_for(&path).await {
-                if !pushed.diagnostics.is_empty() {
-                    break;
-                }
+            // Any first push (even an empty batch) means the initial
+            // analysis pass finished (gopls pushes empty arrays).
+            if client.diagnostics_for(&path).await.is_some() {
+                break;
             }
         }
         result = client.request(method, params, deadline).await?;
