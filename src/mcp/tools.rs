@@ -415,6 +415,9 @@ fn run_references(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
             return missing_server(&server, &raw, &path).await;
         };
+        if !client.supports("textDocument/references").await {
+            return Err(unsupported("textDocument/references"));
+        }
         let params = json!({
             "textDocument": { "uri": uri_string(&path) },
             "position": { "line": line - 1, "character": column - 1 },
@@ -505,6 +508,9 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
             return missing_server(&server, &raw, &path).await;
         };
+        if !client.supports("textDocument/rename").await {
+            return Err(unsupported("textDocument/rename"));
+        }
         let params = json!({
             "textDocument": { "uri": uri_string(&path) },
             "position": { "line": line - 1, "character": column - 1 },
@@ -664,6 +670,10 @@ async fn lsp_position_call(
     let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
         return missing_server(&server, &raw, &path).await;
     };
+    // Capability-aware (P2.4): refuse fast when the server cannot answer.
+    if !client.supports(method).await {
+        return Err(unsupported(method));
+    }
     let params = json!({
         "textDocument": { "uri": uri_string(&path) },
         "position": { "line": line - 1, "character": column - 1 }
@@ -1234,6 +1244,16 @@ fn severity_name(severity: Option<lsp_types::DiagnosticSeverity>) -> &'static st
     }
 }
 
+/// The reply when the server does not advertise a method (P2.4).
+fn unsupported(method: &str) -> ToolError {
+    ToolError::new(
+        ErrorKind::Invalid {
+            hint: format!("the language server does not support {method} (capability absent)"),
+        },
+        "lsp",
+    )
+}
+
 fn invalid(tool: &str, hint: impl AsRef<str>) -> ToolError {
     ToolError::new(
         ErrorKind::Invalid {
@@ -1333,6 +1353,9 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                 return missing_server(&server, &raw, &path).await;
             };
             let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);
+            if !client.supports("workspace/symbol").await {
+                return Err(unsupported("workspace/symbol"));
+            }
             let params = json!({ "query": query });
             // Cold-start guard: a fresh server answers an empty list before
             // it indexed the workspace. Poll within the deadline until the
@@ -1393,6 +1416,9 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let params = json!({
             "textDocument": { "uri": uri_string(&path) }
         });
+        if !client.supports("textDocument/documentSymbol").await {
+            return Err(unsupported("textDocument/documentSymbol"));
+        }
         let result = client
             .request("textDocument/documentSymbol", params, deadline)
             .await?;

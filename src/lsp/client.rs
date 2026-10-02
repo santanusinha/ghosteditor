@@ -49,6 +49,8 @@ struct Inner {
     next_id: AtomicU64,
     /// Diagnostics pushed by the server, per document URI.
     diagnostics: Mutex<HashMap<Uri, PublishDiagnosticsParams>>,
+    /// Server capabilities from the initialize result (P2.4).
+    capabilities: tokio::sync::RwLock<Value>,
     /// Set when the child exited. Later requests fail fast (P1.13).
     dead: std::sync::atomic::AtomicBool,
 }
@@ -122,6 +124,7 @@ impl LspClient {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             diagnostics: Mutex::new(HashMap::new()),
+            capabilities: tokio::sync::RwLock::new(Value::Null),
             dead: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -180,18 +183,57 @@ impl LspClient {
             ..Default::default()
         };
         let deadline_ms = 10_000u64;
-        self.request(
-            "initialize",
-            serde_json::to_value(params).unwrap(),
-            deadline_ms,
-        )
-        .await?;
+        let reply = self
+            .request(
+                "initialize",
+                serde_json::to_value(params).unwrap(),
+                deadline_ms,
+            )
+            .await?;
+        let capabilities = reply
+            .as_object()
+            .and_then(|o| o.get("capabilities"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        *self.inner.capabilities.write().await = capabilities;
         self.notify(
             "initialized",
             serde_json::to_value(InitializedParams {}).unwrap(),
         )
         .await;
         Ok(())
+    }
+
+    /// The raw server capabilities from the initialize reply (P2.4).
+    pub async fn server_capabilities(&self) -> Value {
+        self.inner.capabilities.read().await.clone()
+    }
+
+    /// Does this server support one LSP method? Answers from the stored
+    /// capabilities; an absent flag reads as unsupported (P2.4).
+    pub async fn supports(&self, method: &str) -> bool {
+        let caps = self.server_capabilities().await;
+        let capabilities = match caps.as_object() {
+            Some(object) => object,
+            None => return false,
+        };
+        let flag = match method {
+            "textDocument/definition" => "definitionProvider",
+            "textDocument/hover" => "hoverProvider",
+            "textDocument/references" => "referencesProvider",
+            "textDocument/documentSymbol" => "documentSymbolProvider",
+            "textDocument/rename" => "renameProvider",
+            "workspace/symbol" => "workspaceSymbolProvider",
+            "workspace/didChangeWatchedFiles" => "didChangeWatchedFiles",
+            _ => return true,
+        };
+        match capabilities.get(flag) {
+            Some(Value::Bool(b)) => *b,
+            // An object or a string (e.g. renameProvider: {prepareProvider:
+            // true}) counts as support.
+            Some(Value::Object(_)) | Some(Value::String(_)) => true,
+            _ => false,
+        }
     }
 
     /// True when the child exited (P1.13). Callers can check and degrade.
