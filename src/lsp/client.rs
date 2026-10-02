@@ -162,6 +162,10 @@ impl LspClient {
             capabilities: ClientCapabilities {
                 text_document: Some(TextDocumentClientCapabilities {
                     synchronization: None,
+                    publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                        related_information: Some(true),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
