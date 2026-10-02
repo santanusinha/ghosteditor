@@ -413,7 +413,9 @@ fn run_rename(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                     }
                 }
             }
-            result = client.request("textDocument/rename", params, deadline).await;
+            result = client
+                .request("textDocument/rename", params, deadline)
+                .await;
         }
         let result = result?;
         let workspace_edit = match result.as_object() {

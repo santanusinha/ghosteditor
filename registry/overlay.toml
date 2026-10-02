@@ -1,0 +1,214 @@
+# ghostedit registry overlay — the only hand-maintained registry file.
+#
+# mason-registry owns "how to install" (versions, purls, assets, exe names).
+# This file owns "how to launch": language key, extensions, launch args, and
+# which extensions route to the server by default when no config entry exists.
+#
+# Fields per [[server]]:
+#   name        mason package name (required, merge key)
+#   language    config-style language key (default: first mason language)
+#   extensions  file extensions this server handles
+#   args        launch args after the binary (e.g. ["--stdio"])
+#   default_for extensions that route here when config has no entry
+#   bin         force an exe name (for exotic mason templates)
+#   supported   pin off (false = manual install only)
+#
+# Servers without an entry here stay installable via install_server but are
+# never auto-routed; user config [languages.X] command launches them.
+
+[[server]]
+name = "pyright"
+language = "python"
+extensions = [".py", ".pyi"]
+args = ["--stdio"]
+default_for = [".py"]
+
+[[server]]
+name = "python-lsp-server"
+language = "python"
+extensions = [".py", ".pyi"]
+args = []
+
+[[server]]
+name = "jedi-language-server"
+language = "python"
+extensions = [".py", ".pyi"]
+args = []
+
+[[server]]
+name = "typescript-language-server"
+language = "typescript"
+extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]
+args = ["--stdio"]
+default_for = [".ts", ".tsx"]
+
+[[server]]
+name = "deno"
+language = "typescript"
+extensions = [".ts", ".tsx", ".js", ".jsx"]
+args = ["lsp"]
+
+[[server]]
+name = "gopls"
+language = "go"
+extensions = [".go"]
+args = []
+default_for = [".go"]
+
+[[server]]
+name = "rust-analyzer"
+language = "rust"
+extensions = [".rs"]
+args = []
+default_for = [".rs"]
+
+[[server]]
+name = "clangd"
+language = "cpp"
+extensions = [".c", ".h", ".cpp", ".hpp", ".cc", ".hh", ".cxx"]
+args = ["--background-index"]
+default_for = [".c", ".cpp"]
+
+[[server]]
+name = "lua-language-server"
+language = "lua"
+extensions = [".lua"]
+args = []
+default_for = [".lua"]
+
+[[server]]
+name = "bash-language-server"
+language = "bash"
+extensions = [".sh", ".bash"]
+args = ["start"]
+default_for = [".sh"]
+
+[[server]]
+name = "yaml-language-server"
+language = "yaml"
+extensions = [".yaml", ".yml"]
+args = ["--stdio"]
+default_for = [".yaml"]
+
+[[server]]
+name = "vscode-html-language-server"
+language = "html"
+extensions = [".html", ".htm"]
+args = ["--stdio"]
+default_for = [".html"]
+
+[[server]]
+name = "vscode-css-language-server"
+language = "css"
+extensions = [".css", ".scss", ".less"]
+args = ["--stdio"]
+default_for = [".css"]
+
+[[server]]
+name = "vscode-json-language-server"
+language = "json"
+extensions = [".json", ".jsonc"]
+args = ["--stdio"]
+default_for = [".json"]
+
+[[server]]
+name = "marksman"
+language = "markdown"
+extensions = [".md", ".markdown"]
+args = []
+default_for = [".md"]
+
+[[server]]
+name = "prosemd-lsp"
+language = "markdown"
+extensions = [".md"]
+args = []
+
+[[server]]
+name = "zls"
+language = "zig"
+extensions = [".zig"]
+args = []
+default_for = [".zig"]
+
+[[server]]
+name = "elixir-ls"
+language = "elixir"
+extensions = [".ex", ".exs"]
+args = []
+
+[[server]]
+name = "erlang-ls"
+language = "erlang"
+extensions = [".erl", ".hrl"]
+args = []
+
+[[server]]
+name = "haskell-language-server"
+language = "haskell"
+extensions = [".hs", ".lhs"]
+args = ["--lsp"]
+
+[[server]]
+name = "ruby-lsp"
+language = "ruby"
+extensions = [".rb"]
+args = []
+
+[[server]]
+name = "solargraph"
+language = "ruby"
+extensions = [".rb"]
+args = ["stdio"]
+
+[[server]]
+name = "kotlin-language-server"
+language = "kotlin"
+extensions = [".kt", ".kts"]
+args = []
+
+[[server]]
+name = "omnisharp"
+language = "csharp"
+extensions = [".cs"]
+args = ["-lsp"]
+
+[[server]]
+name = "lemminx"
+language = "xml"
+extensions = [".xml", ".xsd"]
+args = []
+
+[[server]]
+name = "taplo"
+language = "toml"
+extensions = [".toml"]
+args = ["lsp"]
+default_for = [".toml"]
+
+[[server]]
+name = "vim-language-server"
+language = "vim"
+extensions = [".vim"]
+args = []
+
+[[server]]
+name = "dockerfile-language-server-nodejs"
+language = "dockerfile"
+extensions = [".dockerfile"]
+args = ["--stdio"]
+
+[[server]]
+name = "graphql-lsp"
+language = "graphql"
+extensions = [".graphql", ".gql"]
+args = ["server", "--stdout"]
+
+# jdtls needs a generic-source download recipe plus workspace setup.
+# Deferred to Phase 3 (approved 2026-10-02).
+[[server]]
+name = "jdtls"
+language = "java"
+extensions = [".java"]
+args = []
+supported = false

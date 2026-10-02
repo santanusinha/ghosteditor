@@ -5,6 +5,17 @@ edition = "2021"
 description = "A headless editor MCP: file ops plus direct LSP, no editor, no hangs"
 license = "MIT"
 
+[lib]
+name = "ghostedit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostedit"
+path = "src/main.rs"
+
+[workspace]
+members = ["xtask"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
