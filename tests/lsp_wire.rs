@@ -46,7 +46,7 @@ send({"jsonrpc":"2.0","id":msg["id"],"result":{"capabilities":{}},"serverInfo":{
         .unwrap()
         .write_all(&frame(&request))
         .unwrap();
-    let mut output = String::new();
+    let output = String::new();
     use std::io::Read;
     // Read exactly one framed response.
     let mut stdout = child.stdout.take().unwrap();

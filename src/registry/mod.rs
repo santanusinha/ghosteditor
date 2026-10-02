@@ -159,7 +159,7 @@ impl Registry {
             .iter()
             .filter(|r| {
                 r.overlay.as_ref().is_some_and(|o| o.language == lower)
-                    || r.languages.iter().any(|l| *l == lower)
+                    || r.languages.contains(&lower)
             })
             .collect()
     }

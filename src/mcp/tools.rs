@@ -663,7 +663,7 @@ fn apply_text_edits(text: &mut String, edits: &Value) {
         }
     }
     // Apply back-to-front so offsets stay valid.
-    ranges.sort_by(|a, b| b.0.cmp(&a.0));
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
     for (start, end, new_text) in ranges {
         let start = start.min(text.len());
         let end = end.min(text.len()).max(start);

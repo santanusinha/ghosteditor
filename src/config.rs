@@ -169,7 +169,7 @@ impl Config {
             }
         });
         let mut languages = serde_json::Map::new();
-        for (name, _) in &self.languages {
+        for name in self.languages.keys() {
             let d = self.deadlines_for(name);
             languages.insert(
                 name.clone(),
