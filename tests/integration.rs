@@ -139,3 +139,50 @@ fn edit_text_refuses_ambiguous_match_with_a_hint() {
         .to_string();
     assert!(hint.contains("matches"), "hint was: {hint}");
 }
+
+#[test]
+fn symbols_tool_is_registered_with_a_symbol_deadline() {
+    // P2.8: the 12th tool is 'symbols' with path and query inputs.
+    let list_msg = serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}});
+    let responses = drive(
+        &[],
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            list_msg,
+        ],
+    );
+    let list = responses
+        .iter()
+        .find(|r| r.pointer("/result/tools").is_some())
+        .unwrap();
+    let tools = list.pointer("/result/tools").unwrap().as_array().unwrap();
+    let symbols = tools
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("symbols"))
+        .expect("symbols tool registered");
+    assert!(symbols.pointer("/inputSchema/properties/path").is_some());
+    assert!(symbols.pointer("/inputSchema/properties/query").is_some());
+}
+
+#[test]
+fn symbols_rejects_empty_arguments() {
+    // P2.8: no path and no query is a structured Invalid error.
+    let responses = drive(
+        &[],
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"symbols","arguments":{}}}),
+        ],
+    );
+    let call = responses
+        .iter()
+        .find(|r| r.get("id").and_then(|i| i.as_i64()) == Some(2))
+        .unwrap();
+    assert_eq!(
+        call.pointer("/result/isError").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(call.pointer("/result/structuredContent/error").is_some());
+}
