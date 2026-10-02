@@ -26,10 +26,13 @@ pub enum Step {
         dest: PathBuf,
         format: ArchiveFormat,
     },
-    /// Copy the produced binary to `<dir>/bin/<name>` and mark it +x.
+    /// Place the produced binary at `<dir>/bin/<name>`. `link` makes a
+    /// symlink instead of a copy; node bin wrappers resolve `require()`
+    /// relative to the real file, so a copy breaks them.
     EnsureBin {
         from: PathBuf,
         to: PathBuf,
+        link: bool,
     },
 }
 
@@ -193,6 +196,7 @@ pub fn plan(recipe: &Recipe, version: Option<&str>, root: &Path) -> Result<Insta
             steps.push(Step::EnsureBin {
                 from,
                 to: to.clone(),
+                link: true,
             });
             (Some("npm"), to)
         }
@@ -294,6 +298,7 @@ pub fn plan(recipe: &Recipe, version: Option<&str>, root: &Path) -> Result<Insta
                     steps.push(Step::EnsureBin {
                         from,
                         to: to.clone(),
+                        link: false,
                     });
                 }
             }
@@ -438,11 +443,32 @@ pub async fn run_step(step: &Step, log: &mut String) -> Result<(), String> {
                 .map_err(|e| format!("unpack task: {e}"))??;
             Ok(())
         }
-        Step::EnsureBin { from, to } => {
+        Step::EnsureBin { from, to, link } => {
             if let Some(parent) = to.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            }
+            if *link {
+                // Absolute symlink inside the install dir: node resolves the
+                // real file, so the wrapper keeps working from bin/.
+                #[cfg(unix)]
+                {
+                    if tokio::fs::symlink_metadata(to).await.is_ok() {
+                        tokio::fs::remove_file(to)
+                            .await
+                            .map_err(|e| format!("remove {}: {e}", to.display()))?;
+                    }
+                    tokio::fs::symlink(from, to)
+                        .await
+                        .map_err(|e| format!("link {} -> {}: {e}", from.display(), to.display()))?;
+                    return Ok(());
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = from;
+                    return Err("symlink install needs unix".to_string());
+                }
             }
             // Copy (not link): the install dir must survive the cache dir.
             tokio::fs::copy(from, to)
