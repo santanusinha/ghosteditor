@@ -26,12 +26,30 @@ pub struct LspManager {
     restarts: Mutex<HashMap<String, (u32, std::time::Instant)>>,
     /// Last use per language, for idle eviction (P2.10).
     last_used: Mutex<HashMap<String, std::time::Instant>>,
+    /// Spawn time per language, for the warm-up grace (P3.3).
+    spawned_at: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// Cap: at most 3 restarts per 60 s, then the language stays down with
 /// a reason (plan 4.5.7).
 const RESTART_CAP: u32 = 3;
 const RESTART_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Warm-up grace: a fresh spawn is never evicted inside this window, even
+/// when the idle timeout is shorter, so a cold server is not killed while
+/// it answers its first calls (P3.3).
+const WARMUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// True when a client with this idle time and spawn age is an eviction
+/// candidate. The warm-up grace keeps a fresh spawn alive (P3.3).
+fn eviction_candidate(
+    idle: std::time::Duration,
+    spawn_age: Option<std::time::Duration>,
+    idle_after: std::time::Duration,
+) -> bool {
+    let warmed = spawn_age.map(|age| age >= WARMUP_GRACE).unwrap_or(true);
+    idle > idle_after && warmed
+}
 
 impl LspManager {
     pub fn new(config: Config, registry: std::sync::Arc<tokio::sync::RwLock<Registry>>) -> Self {
@@ -42,6 +60,7 @@ impl LspManager {
             spawning: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
             last_used: Mutex::new(HashMap::new()),
+            spawned_at: Mutex::new(HashMap::new()),
         }
     }
 
@@ -61,14 +80,20 @@ impl LspManager {
         let mut evicted = Vec::new();
         let candidates: Vec<String> = {
             let used = self.last_used.lock().await;
+            let spawned = self.spawned_at.lock().await;
             self.clients
                 .lock()
                 .await
                 .keys()
                 .filter(|language| {
-                    used.get(*language)
-                        .map(|last| now.duration_since(*last) > idle_after)
-                        .unwrap_or(true)
+                    // Idle time: last use when present, else the spawn
+                    // clock; a client with no clock at all stays.
+                    let idle = used
+                        .get(*language)
+                        .map(|last| now.duration_since(*last))
+                        .or_else(|| spawned.get(*language).map(|at| now.duration_since(*at)));
+                    let age = spawned.get(*language).map(|at| now.duration_since(*at));
+                    idle.is_some_and(|idle| eviction_candidate(idle, age, idle_after))
                 })
                 .cloned()
                 .collect()
@@ -79,6 +104,7 @@ impl LspManager {
                 client.shutdown().await;
                 evicted.push(language.clone());
                 self.last_used.lock().await.remove(&language);
+                self.spawned_at.lock().await.remove(&language);
                 crate::util::logging::info(format!("lsp: evicted idle client for {language}"));
             }
         }
@@ -164,6 +190,11 @@ impl LspManager {
             .lock()
             .await
             .insert(language.to_string(), client.clone());
+        // P3.3: record the spawn clock for the warm-up grace.
+        self.spawned_at
+            .lock()
+            .await
+            .insert(language.to_string(), std::time::Instant::now());
         self.touch(language).await;
         Ok(Some(client))
     }
@@ -291,6 +322,12 @@ impl LspManager {
             .lock()
             .await
             .insert(language.to_string(), client.clone());
+        // P3.3: a fresh client is never evicted before its warm-up grace,
+        // so a short idle window does not kill a server mid-analysis.
+        self.spawned_at
+            .lock()
+            .await
+            .insert(language.to_string(), std::time::Instant::now());
         Ok(Some((language.to_string(), client)))
     }
 }
@@ -318,5 +355,42 @@ mod tests {
         // clock only gates clients that exist.
         let evicted = manager.evict_idle(std::time::Duration::from_secs(0)).await;
         assert!(evicted.is_empty());
+    }
+
+    /// P3.3: the warm-up grace keeps a fresh spawn alive inside 30 s, even
+    /// with a zero idle window; a warmed-up idle client is a candidate.
+    #[test]
+    fn warmup_grace_gates_eviction() {
+        let zero = std::time::Duration::from_secs(0);
+        // Zero idle window would evict at once; the grace holds.
+        assert!(!eviction_candidate(
+            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
+            zero
+        ));
+        // Idle past the window and warmed up: evicted.
+        assert!(eviction_candidate(
+            std::time::Duration::from_secs(45),
+            Some(std::time::Duration::from_secs(45)),
+            std::time::Duration::from_secs(30)
+        ));
+        // Idle inside the window: kept.
+        assert!(!eviction_candidate(
+            std::time::Duration::from_secs(10),
+            Some(std::time::Duration::from_secs(40)),
+            std::time::Duration::from_secs(30)
+        ));
+        // Idle past a short window but still inside the grace: kept.
+        assert!(!eviction_candidate(
+            std::time::Duration::from_secs(20),
+            Some(std::time::Duration::from_secs(20)),
+            std::time::Duration::from_secs(10)
+        ));
+        // No spawn clock recorded: the idle rule alone decides.
+        assert!(eviction_candidate(
+            std::time::Duration::from_secs(40),
+            None,
+            std::time::Duration::from_secs(30)
+        ));
     }
 }

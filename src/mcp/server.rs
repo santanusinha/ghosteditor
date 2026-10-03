@@ -109,8 +109,13 @@ fn spawn_idle_eviction(config: &Config, lsp: &std::sync::Arc<LspManager>) {
     }
     let idle_after = std::time::Duration::from_secs(config.idle_evict_min * 60);
     let lsp = std::sync::Arc::clone(lsp);
+    // P3.3: sweep more often for short windows, capped at 60 s, floored at 5 s.
+    let sweep = (idle_after / 4).clamp(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(60),
+    );
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut tick = tokio::time::interval(sweep);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
