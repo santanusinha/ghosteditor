@@ -394,7 +394,28 @@ cargo fmt --check
 - `xtask registry-gen` regenerates the embedded registry snapshot from a
   mason release.
 
+### Static release binary
+
+The release build is one static executable with no runtime dependencies.
+
+```bash
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked --release \
+  --target x86_64-unknown-linux-gnu
+file target/x86_64-unknown-linux-gnu/release/ghostedit
+# ELF 64-bit ... statically linked
+```
+
+A push of a `v*` tag runs `.github/workflows/release.yml`. The workflow builds
+the binary on ubuntu, checks that it is statically linked, answers one
+`initialize` round trip, strips it, and attaches a tarball (binary, README,
+LICENSE, CHANGELOG) plus a sha256 checksum to the GitHub release.
+
+The toolchain is pinned in `rust-toolchain.toml`. Bump the pin deliberately so
+release builds stay reproducible. A musl build (`x86_64-unknown-linux-musl`)
+also works when `musl-tools` is installed; the shipped binary uses the glibc
+static recipe above because CI verifies exactly that one.
+
 ## Status
 
-Phase 3 (polish) is in progress. The full plan lives in `plan.md`. See
+Phase 3 (polish) is complete. The full plan lives in `plan.md`. See
 `CHANGELOG.md` for the change history.

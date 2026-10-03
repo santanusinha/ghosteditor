@@ -1,0 +1,3 @@
+# Pinned toolchain for reproducible release builds. Bump deliberately.
+[toolchain]
+channel = "1.96.0"

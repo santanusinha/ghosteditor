@@ -64,6 +64,17 @@ released yet; the 0.1.0 section ships with the first release.
   `bench/RESULTS.md`): initialize latency and token cost per round trip.
 - An `IndexStore` trait with a no-op implementation, so a real search
   backend can plug in later without tool-layer changes.
+- Performance work: an event-driven diagnostics settle (25 ms mailbox
+  polls up to 300 ms instead of a fixed sleep), an `open_file` LSP
+  pre-warm task that never blocks the reply, and a parallel search
+  walker (scoped thread pool, deterministic sort). A 4,920-file tree
+  dropped from 269-632 ms to 50-130 ms per query.
+- A per-language CI conformance matrix (rust, python, go, typescript);
+  each job installs only its own language server.
+- A release workflow: a `v*` tag builds one static linux-x86_64 binary,
+  smoke tests it, and attaches a tarball plus a sha256 checksum to the
+  GitHub release. The toolchain is pinned in `rust-toolchain.toml`.
+- MIT `LICENSE` file.
 
 ### Changed
 
@@ -72,6 +83,9 @@ released yet; the 0.1.0 section ships with the first release.
   extra budget.
 - Search and symbols stay walker and LSP based in v1. No local index
   database; the `IndexStore` seam covers a later backend.
+- The release profile enables thin LTO and one codegen unit.
+- The binary links the registry through the library crate instead of a
+  second module copy; `cargo clippy --all-targets` is warning-free.
 
 ### Fixed
 
