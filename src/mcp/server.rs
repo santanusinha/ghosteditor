@@ -65,6 +65,12 @@ impl Server {
                     message
                 }
                 Ok(None) => break, // stdin closed: clean exit
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    // Malformed frame: log, resync, keep serving. One garbage
+                    // burst must not take the session down.
+                    logging::info(format!("malformed frame on stdin: {error}; resyncing"));
+                    continue;
+                }
                 Err(error) => {
                     logging::info(format!("stdin read failed: {error}"));
                     break;
@@ -334,6 +340,57 @@ fn error_result(id: Value, code: i64, message: &str) -> Value {
 /// Content-Length framing and newline-delimited JSON (NDJSON). None means
 /// EOF. The first byte decides: `{` starts an NDJSON line, `C`/`c` starts
 /// a header.
+/// Wire-format guards. A malformed frame must fail fast instead of
+/// stalling the reader or eating memory. On InvalidData the run loop
+/// resyncs and keeps serving.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HEADER_LINES: usize = 64;
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// True when every byte of `name` is a valid RFC 7230 header token
+/// character. Used to reject garbage lines that would otherwise be
+/// eaten as headers and desync the stream.
+fn is_header_token(name: &str) -> bool {
+    const TCHAR: &str = "!#$%&'*+-.^_`|~";
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || TCHAR.contains(c))
+}
+
+/// Consume bytes through the next newline. Used before a mid-line
+/// InvalidData return so the stream stays on a line boundary.
+async fn skip_to_line_end<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<()> {
+    let mut byte = [0u8; 1];
+    loop {
+        let n = reader.read(&mut byte).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        if byte[0] == b'\n' {
+            return Ok(());
+        }
+    }
+}
+
+/// Reject a header line that is not `Token: value`. Garbage that
+/// cannot be a header must fail at once; otherwise the parser would
+/// eat the following valid messages as "headers".
+fn validate_header_line(line: &str) -> Result<(), std::io::Error> {
+    let (name, _) = line
+        .split_once(':')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a header line"))?;
+    if is_header_token(name.trim()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed header line",
+        ))
+    }
+}
+
 async fn read_message<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<(Vec<u8>, bool)>, std::io::Error> {
@@ -359,6 +416,13 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
                 break;
             }
             body.push(byte[0]);
+            if body.len() > MAX_LINE_BYTES {
+                skip_to_line_end(reader).await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ndjson line too long",
+                ));
+            }
         }
         return Ok(Some((body, true)));
     }
@@ -377,16 +441,26 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
             break;
         }
         header.push(byte[0]);
+        if header.len() > MAX_HEADER_BYTES {
+            skip_to_line_end(reader).await?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "header line too long",
+            ));
+        }
     }
     let header = String::from_utf8_lossy(&header).trim().to_string();
+    validate_header_line(&header)?;
     if let Some(value) = header
         .strip_prefix("Content-Length:")
         .or_else(|| header.strip_prefix("content-length:"))
     {
         content_length = value.trim().parse::<usize>().ok();
     }
-    // Further headers until the blank line.
-    loop {
+    // Further headers until the blank line. Bounded: garbage input must
+    // fail fast, never eat the stream.
+    let mut unterminated = true;
+    for _ in 0..MAX_HEADER_LINES {
         let mut line = Vec::new();
         loop {
             let mut byte = [0u8; 1];
@@ -395,14 +469,23 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
                 return Ok(None);
             }
             if byte[0] == b'\n' {
+                unterminated = false;
                 break;
             }
             line.push(byte[0]);
+            if line.len() > MAX_HEADER_BYTES {
+                skip_to_line_end(reader).await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "header line too long",
+                ));
+            }
         }
         let line = String::from_utf8_lossy(&line).trim().to_string();
         if line.is_empty() {
             break;
         }
+        validate_header_line(&line)?;
         if let Some(value) = line
             .strip_prefix("Content-Length:")
             .or_else(|| line.strip_prefix("content-length:"))
@@ -410,8 +493,20 @@ async fn read_message<R: tokio::io::AsyncRead + Unpin>(
             content_length = value.trim().parse::<usize>().ok();
         }
     }
+    if unterminated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unterminated header block",
+        ));
+    }
     let length = match content_length {
-        Some(length) => length,
+        Some(length) if length <= MAX_BODY_BYTES => length,
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame body too large",
+            ))
+        }
         None => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -465,5 +560,50 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         let message = read_message(&mut cursor).await.unwrap();
         assert!(message.is_none());
+    }
+
+    #[tokio::test]
+    async fn garbage_then_ndjson_resyncs() {
+        // A garbage burst must not eat the next valid message.
+        let mut input = b"\nthis is not a frame\n\x00\x01junk\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":7}\n");
+        let mut cursor = std::io::Cursor::new(input);
+        // Each garbage line is one structured error; the run loop logs
+        // and retries, so keep calling until a valid frame arrives.
+        let mut errors = 0;
+        let parsed = loop {
+            match read_message(&mut cursor).await {
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                    errors += 1;
+                }
+                Ok(Some((message, ndjson))) => {
+                    assert!(ndjson);
+                    break serde_json::from_slice::<Value>(&message).unwrap();
+                }
+                Ok(None) => panic!("eof before the valid message"),
+            }
+        };
+        assert_eq!(errors, 2, "both garbage lines must error once each");
+        assert_eq!(parsed["id"], json!(7));
+    }
+
+    #[tokio::test]
+    async fn json_line_in_header_block_is_rejected() {
+        // A JSON line must never be consumed as a header.
+        let mut input = b"Content-Length: 99\r\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\"}\n");
+        let mut cursor = std::io::Cursor::new(input);
+        let result = read_message(&mut cursor).await;
+        assert!(result.is_err(), "json line as header must fail fast");
+    }
+
+    #[tokio::test]
+    async fn oversized_body_length_is_rejected() {
+        let mut input = b"Content-Length: 999999999\r\n\r\n".to_vec();
+        input.extend_from_slice(b"{}");
+        let mut cursor = std::io::Cursor::new(input);
+        let result = read_message(&mut cursor).await;
+        assert!(result.is_err(), "bogus content-length must fail fast");
     }
 }
