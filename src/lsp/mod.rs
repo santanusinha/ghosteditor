@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::lsp::client::LspClient;
-use crate::registry::Registry;
 use crate::util::ToolError;
+use ghostedit::registry::Registry;
 
 /// Manages one client per language. Spawn on first use.
 pub struct LspManager {
@@ -229,7 +229,7 @@ impl LspManager {
         let resolved = {
             let registry = self.registry.read().await;
             let recipes = registry.recipes_for_extension(&ext);
-            let is_default = |r: &&crate::registry::Recipe| {
+            let is_default = |r: &&ghostedit::registry::Recipe| {
                 r.supported
                     && r.overlay
                         .as_ref()
@@ -272,7 +272,7 @@ impl LspManager {
             .map(|e| format!(".{e}"))?;
         let registry = self.registry.read().await;
         let recipes = registry.recipes_for_extension(&ext);
-        let is_default = |r: &&crate::registry::Recipe| {
+        let is_default = |r: &&ghostedit::registry::Recipe| {
             r.supported
                 && r.overlay
                     .as_ref()

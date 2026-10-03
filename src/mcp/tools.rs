@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::fsops::{write_atomic, WriteOutcome};
 use crate::mcp::Server;
-use crate::registry::jobs as registry_jobs;
 use crate::util::{ErrorKind, ToolError};
+use ghostedit::registry::jobs as registry_jobs;
 
 /// A tool description visible to the agent.
 pub struct Tool {

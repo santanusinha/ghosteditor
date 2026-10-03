@@ -15,10 +15,10 @@ use crate::config::Config;
 use crate::docstore::DocStore;
 use crate::lsp::LspManager;
 use crate::mcp::tools;
-use crate::registry::jobs::JobManager;
-use crate::registry::Registry;
 use crate::util::logging;
 use crate::util::{ErrorKind, ToolError};
+use ghostedit::registry::jobs::JobManager;
+use ghostedit::registry::Registry;
 
 /// Shared state for tool handlers.
 pub struct Server {
@@ -148,7 +148,7 @@ fn spawn_registry_refresh(
         RefreshMode::Unknown => ("latest".to_string(), "latest"),
     };
     tokio::spawn(async move {
-        let fetch = crate::registry::refresh::refresh(&tag);
+        let fetch = ghostedit::registry::refresh::refresh(&tag);
         match tokio::time::timeout(Duration::from_secs(60), fetch).await {
             Ok(Ok(fresh)) => {
                 let pin = fresh.pin.clone();
@@ -291,7 +291,7 @@ async fn handle_tools_call(
 
 /// The per-language server status map for initialize (P2.6e). One entry per
 /// overlay language, with its probe status.
-fn registry_languages(registry: &crate::registry::Registry) -> serde_json::Value {
+fn registry_languages(registry: &ghostedit::registry::Registry) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for recipe in &registry.recipes {
         let Some(overlay) = &recipe.overlay else {
