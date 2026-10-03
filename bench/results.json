@@ -1,0 +1,61 @@
+{
+  "s3_startup": {
+    "runs": 5,
+    "min_ms": 13.9,
+    "median_ms": 22.2,
+    "max_ms": 25.0,
+    "s3_pass": true
+  },
+  "ghostedit_payloads": {
+    "open_file": {
+      "chars_text": 54,
+      "tokens_text": 14,
+      "chars_struct": 174,
+      "tokens_struct": 44
+    },
+    "read_file": {
+      "chars_text": 194,
+      "tokens_text": 49,
+      "chars_struct": 271,
+      "tokens_struct": 68
+    },
+    "edit_lines": {
+      "chars_text": 60,
+      "tokens_text": 15,
+      "chars_struct": 219,
+      "tokens_struct": 55
+    },
+    "hover": {
+      "chars_text": 37,
+      "tokens_text": 9,
+      "chars_struct": 51,
+      "tokens_struct": 13
+    },
+    "diagnostics": {
+      "chars_text": 43,
+      "tokens_text": 11,
+      "chars_struct": 194,
+      "tokens_struct": 49
+    }
+  },
+  "s4_comparison": [
+    {
+      "op": "edit_lines",
+      "ghostedit_tokens": 15,
+      "nvim_tokens": 23,
+      "s4_pass": true
+    },
+    {
+      "op": "hover",
+      "ghostedit_tokens": 9,
+      "nvim_tokens": 15,
+      "s4_pass": true
+    },
+    {
+      "op": "read_file",
+      "ghostedit_tokens": 49,
+      "nvim_tokens": 49,
+      "s4_pass": true
+    }
+  ]
+}

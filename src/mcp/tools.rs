@@ -1183,11 +1183,15 @@ fn run_read_file(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let slice = store
             .read(&path, start, end)
             .ok_or_else(|| internal("read_file", "document missing after open"))?;
+        // nvim-parity numbering (S4/G2): right-align to the widest printed
+        // line number, then two spaces. Same shape the nvim tools emit.
+        let last = slice.start_line + slice.lines.len().saturating_sub(1);
+        let width = last.to_string().len();
         let numbered: Vec<String> = slice
             .lines
             .iter()
             .enumerate()
-            .map(|(i, line)| format!("{:>6}\t{}", slice.start_line + i, line))
+            .map(|(i, line)| format!("{:>width$}  {}", slice.start_line + i, line, width = width))
             .collect();
         let mut text = numbered.join("\n");
         if slice.truncated {

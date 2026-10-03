@@ -1,0 +1,6 @@
+{
+  "_comment": "neovim-use-mcp baseline outputs captured 2026-10-03 from a live session on /tmp/ge-rust/src/main.rs (9 lines). Keys match bench.py op names. Token metric: chars/4 on the exact text the agent sees.",
+  "read_file": "/tmp/ge-rust/src/main.rs\n1  fn add(a: i32, b: i32) -> i32 {\n2      a + b\n3  }\n4  \n5  fn main() {\n6      let sum = add(2, 3);\n7      println!(\"sum is {sum}\");\n8      let broken = add(2, \"x\");\n9  }",
+  "hover": "```rust\nsample\n```\n\n```rust\nfn add(a: i32, b: i32) -> i32\n```",
+  "edit_lines": "Replaced lines 2-2 in /tmp/ge-rust/src/main.rs. File now has 9 lines.\nSaved. No diagnostics."
+}
