@@ -12,6 +12,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Toolchains for the P2.13 conformance suite. A scenario skips when
+      # its server binary is absent, so missing parts degrade to skips.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - run: rustup component add rust-analyzer
+      - run: npm install -g pyright typescript typescript-language-server
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
