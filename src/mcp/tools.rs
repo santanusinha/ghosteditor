@@ -291,6 +291,7 @@ fn registry() -> &'static Vec<Tool> {
                     "query": { "type": "string", "description": "Substring or regex pattern" },
                     "regex": { "type": "boolean", "default": false, "description": "Treat query as a regex" },
                     "offset": { "type": "integer", "default": 0, "description": "Skip the first N matches; pass next_offset to page" },
+                    "glob": { "type": "string", "description": "Restrict to files whose root-relative path matches: * within a segment, ** across segments, ? one char. Example: src/**/*.rs" },
                     "deadline_ms": { "type": "integer" }
                 },
                 "required": ["query"]
@@ -1572,10 +1573,14 @@ fn run_search(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             .get("offset")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        let glob = arguments
+            .get("glob")
+            .and_then(|v| v.as_str())
+            .map(|g| g.to_string());
         let root = server.config.cwd.clone();
         let moved_query = query.clone();
         let result = tokio::task::spawn_blocking(move || {
-            crate::walker::search(&root, &moved_query, regex, offset)
+            crate::walker::search(&root, &moved_query, regex, offset, glob.as_deref())
         })
         .await
         .map_err(|e| internal(tool, format!("walker task failed: {e}")))?

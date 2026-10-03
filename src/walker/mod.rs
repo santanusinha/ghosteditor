@@ -57,13 +57,16 @@ const SKIP_DIRS: &[&str] = &[
 
 /// Search the workspace under `root`. `query` is a case-insensitive
 /// substring when `regex` is false, else a regex pattern. `offset` skips
-/// the first `offset` matches for pagination. A regex compile error is
-/// returned as a string.
+/// the first `offset` matches for pagination. `glob` restricts the walk
+/// to files whose root-relative path matches (P3.5 dogfood mitigation:
+/// a 43k-file repo walks in ~6 s; a glob keeps the common case inside
+/// the deadline). A regex compile error is returned as a string.
 pub fn search(
     root: &Path,
     query: &str,
     regex: bool,
     offset: usize,
+    glob: Option<&str>,
 ) -> Result<SearchResult, String> {
     let pattern = if regex {
         Pattern::Regex(
@@ -83,6 +86,7 @@ pub fn search(
         root,
         &ignore,
         &pattern,
+        glob,
         offset,
         &mut cursor,
         &mut result,
@@ -98,6 +102,7 @@ fn walk(
     dir: &Path,
     parent_ignore: &GitignoreSet,
     pattern: &Pattern,
+    glob: Option<&str>,
     offset: usize,
     cursor: &mut usize,
     result: &mut SearchResult,
@@ -115,12 +120,12 @@ fn walk(
             if SKIP_DIRS.contains(&name) || ignore.matches(&path, true) {
                 continue;
             }
-            walk(root, &path, &ignore, pattern, offset, cursor, result)?;
+            walk(root, &path, &ignore, pattern, glob, offset, cursor, result)?;
         } else if path.is_file() {
             if ignore.matches(&path, false) {
                 continue;
             }
-            scan_file(root, &path, pattern, offset, cursor, result)?;
+            scan_file(root, &path, pattern, glob, offset, cursor, result)?;
         }
     }
     Ok(())
@@ -131,10 +136,22 @@ fn scan_file(
     root: &Path,
     path: &Path,
     pattern: &Pattern,
+    glob: Option<&str>,
     offset: usize,
     cursor: &mut usize,
     result: &mut SearchResult,
 ) -> Result<(), String> {
+    // The glob filter runs before any I/O so a scoped search never
+    // reads files it will not scan (P3.5).
+    let relative = path
+        .strip_prefix(root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string());
+    if let Some(glob) = glob {
+        if !glob_matches(glob, &relative) {
+            return Ok(());
+        }
+    }
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
     };
@@ -151,10 +168,6 @@ fn scan_file(
     let Ok(text) = String::from_utf8(bytes) else {
         return Ok(());
     };
-    let relative = path
-        .strip_prefix(root)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string());
     for (index, line) in text.lines().enumerate() {
         match pattern {
             Pattern::Literal(needle) => {
@@ -180,6 +193,58 @@ fn scan_file(
     }
     result.files_scanned += 1;
     Ok(())
+}
+
+/// Minimal glob for the search filter: `*` matches within one path
+/// segment, `**` crosses segments, `?` is one non-slash char. `a/**/b`
+/// also matches `a/b`. Paths use forward slashes (root-relative).
+pub fn glob_matches(glob: &str, path: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                if p.get(1) == Some(&'*') {
+                    let rest = &p[2..];
+                    (0..=t.len()).any(|i| go(rest, &t[i..]))
+                } else {
+                    let rest = &p[1..];
+                    for i in 0..=t.len() {
+                        if i > 0 && t[i - 1] == '/' {
+                            break;
+                        }
+                        if go(rest, &t[i..]) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+            (Some('?'), Some(&c)) if c != '/' => go(&p[1..], &t[1..]),
+            (Some(&a), Some(&b)) if a == b => go(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    let p: Vec<char> = glob.chars().collect();
+    let t: Vec<char> = path.chars().collect();
+    if go(&p, &t) {
+        return true;
+    }
+    // `a/**/b` also matches `a/b`: retry with the `/**/` collapsed.
+    // `a/**/b` also matches `a/b`, and a leading `**/` is optional:
+    // retry with each form collapsed.
+    if glob.contains("/**/") {
+        let collapsed: Vec<char> = glob.replace("/**/", "/").chars().collect();
+        if go(&collapsed, &t) {
+            return true;
+        }
+    }
+    if let Some(rest) = glob.strip_prefix("**/") {
+        let without: Vec<char> = rest.chars().collect();
+        if go(&without, &t) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Record one match unless past the cap. Every match advances the cursor
@@ -388,7 +453,7 @@ mod tests {
             ("a.txt", "Hello World\nnope\nWORLD ahead"),
             ("sub/b.txt", "world"),
         ]);
-        let result = search(&root, "world", false, 0).expect("search");
+        let result = search(&root, "world", false, 0, None).expect("search");
         assert_eq!(result.matches.len(), 3);
         assert!(result.matches.iter().any(|m| m.line == 3));
         assert!(!result.truncated);
@@ -397,7 +462,7 @@ mod tests {
     #[test]
     fn regex_search_finds_pattern() {
         let (_dir, root) = tmp_with_files(&[("a.txt", "fn add(a, b)\nfn sub()")]);
-        let result = search(&root, "fn [a-z]+\\(", true, 0).expect("search");
+        let result = search(&root, "fn [a-z]+\\(", true, 0, None).expect("search");
         assert_eq!(result.matches.len(), 2);
         assert_eq!(result.matches[0].column, 1);
     }
@@ -410,7 +475,7 @@ mod tests {
             ("app.log", "matchme"),
             ("src/main.rs", "matchme here"),
         ]);
-        let result = search(&root, "matchme", false, 0).expect("search");
+        let result = search(&root, "matchme", false, 0, None).expect("search");
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].path, "src/main.rs");
     }
@@ -422,17 +487,17 @@ mod tests {
             ("node_modules/pkg/index.js", "matchme"),
         ]);
         std::fs::write(root.join("data.bin"), b"matchme\x00binary").expect("write");
-        let result = search(&root, "matchme", false, 0).expect("search");
+        let result = search(&root, "matchme", false, 0, None).expect("search");
         assert_eq!(result.matches.len(), 0);
     }
 
     #[test]
     fn pagination_offsets_and_truncation() {
         let (_dir, root) = tmp_with_files(&[("a.txt", "hit\nhit\nhit\n"), ("b.txt", "hit\n")]);
-        let page1 = search(&root, "hit", false, 0).expect("search");
+        let page1 = search(&root, "hit", false, 0, None).expect("search");
         assert_eq!(page1.matches.len(), 4);
         assert!(!page1.truncated);
-        let page2 = search(&root, "hit", false, 2).expect("search");
+        let page2 = search(&root, "hit", false, 2, None).expect("search");
         assert_eq!(page2.matches.len(), 2);
         // Order across files follows the directory read; assert on content.
         let lines: Vec<usize> = page2.matches.iter().map(|m| m.line).collect();
@@ -442,7 +507,7 @@ mod tests {
     #[test]
     fn bad_regex_is_an_error() {
         let (_dir, root) = tmp_with_files(&[("a.txt", "x")]);
-        let err = search(&root, "(unclosed", true, 0).unwrap_err();
+        let err = search(&root, "(unclosed", true, 0, None).unwrap_err();
         assert!(err.contains("invalid regex"), "got: {err}");
     }
 
@@ -450,7 +515,7 @@ mod tests {
     fn long_lines_are_truncated() {
         let long = format!("{} needle {}", "x".repeat(500), "y".repeat(500));
         let (_dir, root) = tmp_with_files(&[("a.txt", &long)]);
-        let result = search(&root, "needle", false, 0).expect("search");
+        let result = search(&root, "needle", false, 0, None).expect("search");
         assert_eq!(result.matches.len(), 1);
         assert!(result.matches[0].text.chars().count() <= 201);
     }
@@ -468,5 +533,34 @@ mod tests {
     fn substring_offset_maps_case_insensitive_hits() {
         assert_eq!(find_substring("Hello World", "world"), Some(6));
         assert_eq!(find_substring("ÄÖÜ x", "x"), Some(7));
+    }
+
+    #[test]
+    fn glob_matches_segments_and_crosses_dirs() {
+        assert!(glob_matches("*.txt", "a.txt"));
+        assert!(!glob_matches("*.txt", "sub/a.txt"));
+        assert!(glob_matches("src/*.rs", "src/main.rs"));
+        assert!(!glob_matches("src/*.rs", "src/deep/main.rs"));
+        assert!(glob_matches("src/**/*.rs", "src/deep/main.rs"));
+        // `a/**/b` also matches `a/b`.
+        assert!(glob_matches("src/**/main.rs", "src/main.rs"));
+        assert!(glob_matches("?.txt", "a.txt"));
+        assert!(!glob_matches("?.txt", "ab.txt"));
+        assert!(!glob_matches("*.rs", "a.txt"));
+    }
+
+    #[test]
+    fn glob_filter_restricts_the_walk() {
+        let (_dir, root) = tmp_with_files(&[
+            ("a.py", "matchme"),
+            ("sub/b.py", "matchme"),
+            ("c.rs", "matchme"),
+        ]);
+        let result = search(&root, "matchme", false, 0, Some("*.py")).expect("search");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].path, "a.py");
+        let result = search(&root, "matchme", false, 0, Some("**/*.py")).expect("search");
+        assert_eq!(result.matches.len(), 2);
+        assert!(result.files_scanned <= 2);
     }
 }

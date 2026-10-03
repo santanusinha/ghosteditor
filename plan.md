@@ -221,6 +221,17 @@ sync). Two sources only:
   slow on large repos, Turso (libSQL) plugs in behind the trait in a later
   phase: file rows keyed by SHA-256 + mtime + size, FTS5 over symbol names,
   restart-stable (skip unchanged files), branch column as a stretch goal.
+- **P3.5 DECISION (2026-10-03): keep walker-only. No Turso in v1.**
+  Dogfood on vllm (43k walkable files): unscoped search 4-6 s warm, one
+  cold run hit the 10 s read deadline and returned a structured timeout;
+  scoped search with the new `glob` argument is sub-second (392 ms on
+  `csrc/**/*.cpp`, 13 files). The walker plus glob scoping covers the real
+  cases; an index would add the libsql dependency, build and invalidation
+  machinery, and staleness risk for marginal gain. The seam lives in
+  `src/index.rs` (`IndexStore` trait + `NoopIndex`), so a real backend
+  plugs in later without tool-layer changes. The pathological case is
+  covered by the deadline rules: a slow walk times out with a structured
+  error and the agent retries with a glob.
 - Cross-language and cold-start gaps are accepted as startup latency, not
   correctness failures. The anti-hang rules cover them: a cold server
   returns "starting" and the agent moves on.
