@@ -22,11 +22,13 @@ The spec is `plan.md`. Read it before making design changes.
 | `src/fsops.rs` | Atomic writes |
 | `src/lsp/` | Direct LSP clients (Phase 1) |
 | `src/walker/` | Content search (Phase 2) |
-| `src/util/` | Error envelope, stderr logging |
+| `src/util/` | Error envelope, async file logging |
 
 ## Rules
 
-1. Never write to stdout. It carries the MCP protocol. Log to stderr.
+1. Never write to stdout. It carries the MCP protocol. Logs go to the state
+   file (`~/.local/state/ghostedit/ghostedit.log`); stderr carries errors
+   only. Tests spawn the binary with `--log-file off`.
 2. Every tool call runs inside its deadline. A timeout returns a structured
    error through `ToolError`, never silence.
 3. An agent-supplied `deadline_ms` can only lower a budget, never raise it.

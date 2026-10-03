@@ -79,7 +79,11 @@ pub async fn refresh(tag: &str) -> Result<Registry, String> {
 }
 
 fn refresh_blocking(tag: &str) -> Result<Registry, String> {
-    let agent = ureq::Agent::new();
+    // A hard per-call bound. Without it a stalled connection blocks the
+    // spawn_blocking thread past the 60s refresh cap.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
     let resolved = if tag == "latest" {
         latest_tag(&agent)?
     } else {

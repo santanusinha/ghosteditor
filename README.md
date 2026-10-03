@@ -27,7 +27,8 @@ ghostedit speaks MCP over stdio. Point your MCP client at the binary:
 ```
 
 One process serves one workspace. The process dies with the client. Logs go
-to stderr; stdout carries the MCP protocol only.
+to a state file (see Logs); stderr carries errors only; stdout carries the
+MCP protocol only.
 
 ## Configuration
 
@@ -81,8 +82,10 @@ built-in default, not the global `defaults_ms`.
 |---|---|---|---|
 | `--cwd` | `GE_CWD` | process cwd | Workspace root |
 | `--config` | `GE_CONFIG` | `~/.config/ghostedit/config.toml` | Config path |
-| `--debug` | `GE_DEBUG` | off | Trace logging to stderr |
+| `--debug` | `GE_DEBUG` | off | Alias for `--log-level debug` |
 | `--idle-evict-min` | `GE_IDLE_EVICT_MIN` | 15 | Idle LSP eviction in minutes; 0 disables |
+| `--log-file` | `GE_LOG_FILE` | `~/.local/state/ghostedit/ghostedit.log` | Log file path; `off` disables the file |
+| `--log-level` | `GE_LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
 
 Flags win over environment variables.
 
@@ -369,6 +372,30 @@ minutes by default; set `--idle-evict-min 0` to disable. A fresh spawn gets
 a 30 second warm-up grace, so a server is never evicted mid-analysis. The
 sweep interval adapts to the window: idle/4, clamped to 5-60 seconds. The
 next tool call respawns the server.
+
+## Logs
+
+Logs go to a file. The default location is
+`$XDG_STATE_HOME/ghostedit/ghostedit.log`, that is
+`~/.local/state/ghostedit/ghostedit.log`. A relative or empty
+`XDG_STATE_HOME` is ignored, per the XDG spec. `--log-file <path>` moves the
+file. `--log-file off` disables it. Stdout is never touched.
+
+- Levels: `error` < `warn` < `info` < `debug`. The default keeps `info`.
+  `--log-level debug` (or `--debug`) keeps everything.
+- Precedence: `--log-level` > `--debug` > `GE_LOG_LEVEL` > `GE_DEBUG` > info.
+- Line format: `2026-10-03T09:07:03.123Z INFO  message`. UTC, milliseconds.
+- `error` lines also print to stderr. Fatal startup errors stay visible when
+  the file is off or unavailable.
+- Rotation: at 10 MiB the file moves to `ghostedit.log.1`. One old file is
+  kept; a newer rotation replaces it.
+- Writes are asynchronous. One writer thread owns the file, so no tool call
+  blocks on log I/O. The queue drains at exit and on SIGTERM.
+- If the file cannot be opened, one stderr line says so and logging falls
+  back to stderr. A tool call never fails because of logging.
+
+Several ghostedit processes may append to one file. Each line is one
+append-mode write. Short lines do not interleave; very long lines can.
 
 ## Wire protocol
 

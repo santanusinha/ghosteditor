@@ -75,6 +75,13 @@ released yet; the 0.1.0 section ships with the first release.
   smoke tests it, and attaches a tarball plus a sha256 checksum to the
   GitHub release. The toolchain is pinned in `rust-toolchain.toml`.
 - MIT `LICENSE` file.
+- Async file logging. Logs go to `$XDG_STATE_HOME/ghostedit/ghostedit.log`
+  (default `~/.local/state/ghostedit/ghostedit.log`), written by a dedicated
+  thread so no tool call blocks on I/O. Levels `error|warn|info|debug` via
+  `--log-level` / `--debug` / `GE_LOG_LEVEL` / `GE_DEBUG`; `--log-file` /
+  `GE_LOG_FILE` moves or disables the file. Rotation at 10 MiB keeps one
+  `ghostedit.log.1`. `error` lines also reach stderr; stdout stays
+  protocol-only. SIGTERM now shuts down cleanly and drains the log queue.
 
 ### Changed
 
@@ -106,3 +113,6 @@ released yet; the 0.1.0 section ships with the first release.
   replies.
 - `read_file` numbering right-aligns to the widest printed line number,
   matching the nvim tools and saving tokens on large reads.
+- A slow registry fetch no longer holds process exit open: the runtime
+  shutdown waits at most 500 ms, and the fetch agent carries a 30 s
+  timeout.

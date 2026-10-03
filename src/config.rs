@@ -133,12 +133,7 @@ struct Raw {
 impl Config {
     /// Load global config, then project config. The project file replaces
     /// whole language entries. It does not deep-merge them.
-    pub async fn load(
-        explicit: Option<PathBuf>,
-        cwd: Option<PathBuf>,
-        debug: bool,
-    ) -> Result<Self, String> {
-        logging::set_debug(debug);
+    pub async fn load(explicit: Option<PathBuf>, cwd: Option<PathBuf>) -> Result<Self, String> {
         let cwd = cwd.unwrap_or_else(|| {
             std::env::current_dir().expect("could not read the working directory")
         });
@@ -255,7 +250,9 @@ async fn read_raw(path: &Path) -> Option<Raw> {
             Some(raw)
         }
         Err(error) => {
-            logging::info(format!(
+            // A config error must reach stderr too: the user's tables are
+            // being ignored, so silence would hide it.
+            logging::error(format!(
                 "config parse failed at {}: {error}",
                 path.display()
             ));

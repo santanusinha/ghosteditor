@@ -24,7 +24,13 @@ fn frame(payload: &serde_json::Value) -> Vec<u8> {
 fn drive(args: &[&str], messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     use std::process::{Command, Stdio};
     let binary = env!("CARGO_BIN_EXE_ghostedit");
-    let mut child = Command::new(binary)
+    // Keep the suite out of the real state dir unless a test opts in
+    // with its own --log-file (P3.9).
+    let mut command = Command::new(binary);
+    if !args.contains(&"--log-file") {
+        command.args(["--log-file", "off"]);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

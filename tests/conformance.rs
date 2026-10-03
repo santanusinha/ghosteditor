@@ -316,6 +316,9 @@ impl Session {
             .arg(root)
             .arg("--config")
             .arg(root.join("conformance-config.toml"))
+            // P3.9: keep conformance runs out of the real state dir.
+            .arg("--log-file")
+            .arg("off")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

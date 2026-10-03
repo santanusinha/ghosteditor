@@ -15,7 +15,13 @@ fn frame(payload: &serde_json::Value) -> Vec<u8> {
 fn drive(args: &[&str], messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
     use std::process::{Command, Stdio};
     let binary = env!("CARGO_BIN_EXE_ghostedit");
-    let mut child = Command::new(binary)
+    // Keep the suite out of the real state dir unless a test opts in
+    // with its own --log-file (P3.9).
+    let mut command = Command::new(binary);
+    if !args.contains(&"--log-file") {
+        command.args(["--log-file", "off"]);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -185,4 +191,51 @@ fn symbols_rejects_empty_arguments() {
         Some(true)
     );
     assert!(call.pointer("/result/structuredContent/error").is_some());
+}
+
+#[test]
+fn logs_land_in_the_file_when_log_file_is_set() {
+    // P3.9: with --log-file, ready and shutdown land in the file, the
+    // default level keeps debug lines out, and stdout stays protocol-only.
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("ghostedit.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ghostedit"))
+        .arg("--cwd")
+        .arg(dir.path())
+        .arg("--log-file")
+        .arg(log.display().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for message in &initialize_messages() {
+        stdin.write_all(&frame(message)).unwrap();
+    }
+    drop(stdin); // EOF: clean shutdown path
+    let mut protocol = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut protocol)
+        .unwrap();
+    child.wait().unwrap();
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let ready = text
+        .lines()
+        .find(|line| line.contains("ready"))
+        .expect("ready line missing from the log file");
+    assert!(ready.contains("INFO"), "ready line was: {ready}");
+    assert!(text.contains("shutdown complete"), "log was: {text}");
+    assert!(
+        !text.contains("DEBUG"),
+        "debug leaked at info level: {text}"
+    );
+
+    let out = String::from_utf8_lossy(&protocol);
+    assert!(out.contains("ghostedit"), "stdout was: {out}");
+    assert!(!out.contains("INFO"), "log text leaked to stdout: {out}");
 }

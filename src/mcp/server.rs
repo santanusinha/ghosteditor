@@ -156,12 +156,12 @@ fn spawn_registry_refresh(
                 logging::info(format!("registry refreshed from mason tag {pin} ({mode})"));
             }
             Ok(Err(error)) => {
-                logging::info(format!(
+                logging::warn(format!(
                     "registry refresh failed; keeping the snapshot: {error}"
                 ));
             }
             Err(_) => {
-                logging::info("registry refresh timed out after 60s; keeping the snapshot");
+                logging::warn("registry refresh timed out after 60s; keeping the snapshot");
             }
         }
     });
