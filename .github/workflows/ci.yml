@@ -6,26 +6,59 @@ on:
   pull_request:
 
 jobs:
+  # Lint plus the full suite. Conformance scenarios skip when their server
+  # is absent, so this job needs no language toolchains beyond python3
+  # (the mock LSP tests).
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
+  # One job per supported language. Each installs only its own language
+  # server and runs that single conformance scenario.
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, python, go, typescript]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Toolchains for the P2.13 conformance suite. A scenario skips when
-      # its server binary is absent, so missing parts degrade to skips.
       - uses: actions/setup-python@v5
+        if: matrix.language == 'python'
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v4
+        if: matrix.language == 'python' || matrix.language == 'typescript'
         with:
           node-version: "22"
       - uses: actions/setup-go@v5
+        if: matrix.language == 'go'
         with:
           go-version: "stable"
-      - run: rustup component add rust-analyzer
-      - run: npm install -g pyright typescript typescript-language-server
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-      - run: cargo build --release
+      - if: matrix.language == 'rust'
+        run: rustup component add rust-analyzer
+      - if: matrix.language == 'python'
+        run: npm install -g pyright
+      - if: matrix.language == 'typescript'
+        run: npm install -g typescript typescript-language-server
+      - if: matrix.language == 'go'
+        run: go install golang.org/x/tools/gopls@latest
+      - if: matrix.language == 'go'
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: cargo test --test conformance ${{ matrix.language }}_conformance -- --nocapture
