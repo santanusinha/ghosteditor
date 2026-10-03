@@ -56,6 +56,15 @@ struct Spec {
     def_site: &'static str,
     /// Comment marker for the edit round trip.
     marker: &'static str,
+    /// File with an unused import/symbol that has a quickfix action.
+    quickfix_file: &'static str,
+    /// 1-based (line, column) of the quickfix target.
+    quickfix_line: usize,
+    quickfix_column: usize,
+    /// Lower-case substring of the quickfix title to apply.
+    quickfix_title: &'static str,
+    /// Text that must be gone from the file after the quickfix applies.
+    quickfix_gone: &'static str,
 }
 
 fn specs() -> Vec<Spec> {
@@ -74,7 +83,7 @@ fn specs() -> Vec<Spec> {
                 ),
                 (
                     "src/main.rs",
-                    "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\nfn main() {\n    let sum = add(1, 2);\n    println!(\"{sum}\");\n}\n\nmod bad;\n",
+                    "use std::collections::HashMap;\n\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\nfn main() {\n    let sum = add(1, 2);\n    println!(\"{sum}\");\n}\n\nmod bad;\n",
                 ),
                 (
                     "src/bad.rs",
@@ -83,13 +92,13 @@ fn specs() -> Vec<Spec> {
             ],
             hover: Hover {
                 file: "src/main.rs",
-                line: 6,
+                line: 8,
                 column: 15,
                 contains: "add",
             },
             defn: Defn {
                 file: "src/main.rs",
-                line: 1,
+                line: 3,
             },
             outline_name: "add",
             references_min: 2,
@@ -101,6 +110,11 @@ fn specs() -> Vec<Spec> {
             new_name: "plus",
             def_site: "fn plus(",
             marker: "// marker",
+            quickfix_file: "src/main.rs",
+            quickfix_line: 1,
+            quickfix_column: 20,
+            quickfix_title: "remove",
+            quickfix_gone: "HashMap",
         },
         Spec {
             language: "python",
@@ -108,17 +122,17 @@ fn specs() -> Vec<Spec> {
             extensions: &[".py"],
             files: &[(
                 "sample.py",
-                "def add(a: int, b: int) -> int:\n    return a + b\n\n\nresult = add(3, 4)\nprint(result)\n",
+                "import json\n\ndef add(a: int, b: int) -> int:\n    return a + b\n\n\nresult = add(3, 4)\nprint(result)\n",
             )],
             hover: Hover {
                 file: "sample.py",
-                line: 5,
+                line: 6,
                 column: 10,
                 contains: "add",
             },
             defn: Defn {
                 file: "sample.py",
-                line: 1,
+                line: 3,
             },
             outline_name: "add",
             references_min: 2,
@@ -130,6 +144,11 @@ fn specs() -> Vec<Spec> {
             new_name: "plus",
             def_site: "def plus(",
             marker: "# marker",
+            quickfix_file: "sample.py",
+            quickfix_line: 1,
+            quickfix_column: 8,
+            quickfix_title: "remove",
+            quickfix_gone: "json",
         },
         Spec {
             language: "go",
@@ -139,18 +158,18 @@ fn specs() -> Vec<Spec> {
                 ("go.mod", "module conf\n\ngo 1.22\n"),
                 (
                     "main.go",
-                    "package main\n\nimport \"fmt\"\n\nfunc add(a int, b int) int {\n\treturn a + b\n}\n\nfunc main() {\n\tfmt.Println(add(1, 2))\n\tfmt.Println(add(1, \"x\"))\n}\n",
+                    "package main\n\nimport \"fmt\"\nimport \"os\"\n\nfunc add(a int, b int) int {\n\treturn a + b\n}\n\nfunc main() {\n\tfmt.Println(add(1, 2))\n\tfmt.Println(add(1, \"x\"))\n}\n",
                 ),
             ],
             hover: Hover {
                 file: "main.go",
-                line: 11,
+                line: 12,
                 column: 14,
                 contains: "func add",
             },
             defn: Defn {
                 file: "main.go",
-                line: 5,
+                line: 6,
             },
             outline_name: "add",
             references_min: 2,
@@ -162,6 +181,11 @@ fn specs() -> Vec<Spec> {
             new_name: "plus",
             def_site: "func plus(",
             marker: "// marker",
+            quickfix_file: "main.go",
+            quickfix_line: 3,
+            quickfix_column: 8,
+            quickfix_title: "organize imports",
+            quickfix_gone: "\"os\"",
         },
         Spec {
             language: "typescript",
@@ -170,7 +194,7 @@ fn specs() -> Vec<Spec> {
             files: &[
                 (
                     "sample.ts",
-                    "function add(a: number, b: number): number {\n  return a + b;\n}\n\nconst sum = add(1, 2);\nconsole.log(sum);\n",
+                    "import os from \"os\";\n\nfunction add(a: number, b: number): number {\n  return a + b;\n}\n\nconst sum = add(1, 2);\nconsole.log(sum);\n",
                 ),
                 (
                     "bad.ts",
@@ -179,13 +203,13 @@ fn specs() -> Vec<Spec> {
             ],
             hover: Hover {
                 file: "sample.ts",
-                line: 5,
+                line: 6,
                 column: 13,
                 contains: "function add",
             },
             defn: Defn {
                 file: "sample.ts",
-                line: 1,
+                line: 3,
             },
             outline_name: "add",
             references_min: 2,
@@ -197,6 +221,11 @@ fn specs() -> Vec<Spec> {
             new_name: "plus",
             def_site: "function plus(",
             marker: "// marker",
+            quickfix_file: "sample.ts",
+            quickfix_line: 1,
+            quickfix_column: 10,
+            quickfix_title: "remove",
+            quickfix_gone: "\"os\"",
         },
     ]
 }
@@ -546,7 +575,7 @@ fn scenario(spec: &Spec, root: &Path) {
         }
     }
 
-    // 6. rename round trip: reply lists files and disk carries the new name.
+    // 7. rename round trip: reply lists files and disk carries the new name.
     let content = session.call(
         "rename",
         serde_json::json!({
@@ -570,7 +599,55 @@ fn scenario(spec: &Spec, root: &Path) {
         old = spec.old_name
     );
 
-    // 7. edit_lines inserts at the top and saves.
+    // 7. code_actions: list shows a quickfix, apply removes the unused import.
+    let quickfix_path = root.join(spec.quickfix_file).display().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let index = loop {
+        let content = session.call(
+            "code_actions",
+            serde_json::json!({
+                "path": quickfix_path,
+                "line": spec.quickfix_line,
+                "column": spec.quickfix_column,
+            }),
+        );
+        let entries = content["actions"].as_array().cloned().unwrap_or_default();
+        let found = entries.iter().find(|a| {
+            a["title"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(spec.quickfix_title)
+        });
+        if let Some(found) = found {
+            break found["index"].as_u64().unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no quickfix containing {:?}; last reply: {}",
+            spec.quickfix_title,
+            content["text"]
+        );
+        std::thread::sleep(Duration::from_millis(1_000));
+    };
+    let content = session.call(
+        "code_actions",
+        serde_json::json!({
+            "path": quickfix_path,
+            "line": spec.quickfix_line,
+            "column": spec.quickfix_column,
+            "apply": index,
+        }),
+    );
+    let files = content["files"].as_array().cloned().unwrap_or_default();
+    assert!(!files.is_empty(), "code action changed no files");
+    let disk = std::fs::read_to_string(root.join(spec.quickfix_file)).unwrap();
+    assert!(
+        !disk.contains(spec.quickfix_gone),
+        "quickfix target still on disk:\n{disk}"
+    );
+
+    // 8. edit_lines inserts at the top and saves.
     let content = session.call(
         "edit_lines",
         serde_json::json!({
@@ -583,7 +660,7 @@ fn scenario(spec: &Spec, root: &Path) {
     assert_eq!(content["mode"], "insert");
     assert_eq!(content["saved"], true);
 
-    // 8. read_file returns the marker at line 1.
+    // 9. read_file returns the marker at line 1.
     let content = session.call(
         "read_file",
         serde_json::json!({

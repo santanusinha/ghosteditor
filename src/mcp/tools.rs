@@ -234,6 +234,23 @@ fn registry() -> &'static Vec<Tool> {
             run: run_diagnostics,
         },
         Tool {
+            name: "code_actions",
+            description: "List the code actions at a position (quickfix, refactor), or execute one. Pass apply=<index> from a previous list reply to execute that action.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "line": { "type": "integer", "description": "1-based" },
+                    "column": { "type": "integer", "description": "1-based" },
+                    "apply": { "type": "integer", "description": "Index from the list reply; executes that action" },
+                    "deadline_ms": { "type": "integer" }
+                },
+                "required": ["path", "line", "column"]
+            }),
+            deadline_kind: DeadlineKind::Read,
+            run: run_code_actions,
+        },
+        Tool {
             name: "rename",
             description: "Rename a symbol across the workspace. Applies the edit and saves every touched file atomically.",
             input_schema: json!({
@@ -489,6 +506,159 @@ fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
                 "source": d.source,
             })).collect::<Vec<_>>()
         }))
+    })
+}
+
+// ---------- Phase 3: code actions (P3.1) ----------
+
+/// `code_actions`: list the actions at a position, or execute one by index.
+///
+/// The list reply carries one-based indexes. The apply call re-requests the
+/// action list first, so the executed action matches the current file text
+/// instead of a stale cache. When an action carries no edit and the server
+/// advertises resolveProvider, the action is resolved through
+/// codeAction/resolve before it is applied.
+fn run_code_actions(server: Arc<Server>, arguments: Value) -> BoxedFuture {
+    box_future(async move {
+        let tool = "code_actions";
+        let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
+        let line =
+            arg_usize(&arguments, "line").ok_or_else(|| invalid(tool, "line is required"))?;
+        let column =
+            arg_usize(&arguments, "column").ok_or_else(|| invalid(tool, "column is required"))?;
+        let path = resolve_path(&server.config, &raw);
+        ensure_did_open(&server, &path).await?;
+        let deadline = deadline_for(&server, &path, DeadlineKind::Read, &arguments);
+        let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
+            return missing_server(&server, &raw, &path).await;
+        };
+        if !client.supports("textDocument/codeAction").await {
+            return Err(unsupported("textDocument/codeAction"));
+        }
+        // Quickfix actions key on the pushed diagnostics, so the context
+        // carries the latest batch for this file.
+        let context_diagnostics: Vec<Value> = client
+            .diagnostics_for(&path)
+            .await
+            .map(|batch| {
+                batch
+                    .diagnostics
+                    .iter()
+                    .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let params = json!({
+            "textDocument": { "uri": uri_string(&path) },
+            "range": {
+                "start": { "line": line - 1, "character": column - 1 },
+                "end": { "line": line - 1, "character": column - 1 }
+            },
+            "context": { "diagnostics": context_diagnostics },
+        });
+        let mut result = client
+            .request("textDocument/codeAction", params.clone(), deadline)
+            .await?;
+        // Cold-start guard: an empty list often means the first analysis
+        // pass is not done. Wait for the first diagnostics push, then retry
+        // once inside the budget (the same pattern as the position tools).
+        if result.as_array().is_none_or(|items| items.is_empty())
+            && client.diagnostics_for(&path).await.is_none()
+        {
+            let mut waited = 0u64;
+            while waited < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                waited += 500;
+                if client.diagnostics_for(&path).await.is_some() {
+                    break;
+                }
+            }
+            result = client
+                .request("textDocument/codeAction", params, deadline)
+                .await?;
+        }
+        let actions = result.as_array().cloned().unwrap_or_default();
+
+        // Apply mode: execute the action at the given one-based index.
+        if let Some(index) = arguments.get("apply").and_then(|v| v.as_u64()) {
+            if index == 0 {
+                return Err(invalid(
+                    tool,
+                    "apply is a one-based index; use one from the list reply",
+                ));
+            }
+            let Some(action) = actions.get((index - 1) as usize) else {
+                return Err(invalid(
+                    tool,
+                    format!(
+                        "no action at index {index}; the list has {} actions",
+                        actions.len()
+                    ),
+                ));
+            };
+            let mut action = action.clone();
+            if action.get("edit").is_none() {
+                let resolve_supported = client
+                    .server_capabilities()
+                    .await
+                    .pointer("/codeActionProvider/resolveProvider")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !resolve_supported {
+                    return Err(invalid(
+                        tool,
+                        "the action carries no edit and the server cannot resolve it",
+                    ));
+                }
+                action = client
+                    .request("codeAction/resolve", action, deadline)
+                    .await?;
+            }
+            let Some(edit) = action.get("edit").and_then(|e| e.as_object()) else {
+                return Err(invalid(
+                    tool,
+                    format!("action {index} resolved to no workspace edit"),
+                ));
+            };
+            return apply_workspace_edit(&server, edit).await;
+        }
+
+        // List mode: render one line per action with its one-based index.
+        let entries: Vec<Value> = actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                json!({
+                    "index": i + 1,
+                    "title": action["title"].as_str().unwrap_or(""),
+                    "kind": action["kind"].as_str().unwrap_or(""),
+                    "is_preferred": action["isPreferred"].as_bool().unwrap_or(false),
+                    "has_edit": action.get("edit").is_some(),
+                })
+            })
+            .collect();
+        let text = if entries.is_empty() {
+            "No code actions.".to_string()
+        } else {
+            entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{}. [{}] {}{}",
+                        e["index"],
+                        e["kind"].as_str().unwrap_or(""),
+                        e["title"].as_str().unwrap_or(""),
+                        if e["is_preferred"].as_bool().unwrap_or(false) {
+                            " (preferred)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(json!({ "text": text, "actions": entries, "count": entries.len() }))
     })
 }
 
@@ -862,7 +1032,7 @@ async fn apply_workspace_edit(
         "No changes produced.".to_string()
     } else {
         format!(
-            "Renamed in {} file(s): {}",
+            "Applied edits in {} file(s): {}",
             changed_files.len(),
             changed_files.join(", ")
         )

@@ -172,6 +172,28 @@ impl LspClient {
                         related_information: Some(true),
                         ..Default::default()
                     }),
+                    // P3.1: rust-analyzer answers codeAction with null
+                    // unless the client declares code action literal
+                    // support (the same gate pattern as publishDiagnostics
+                    // for typescript-language-server, P2.3).
+                    code_action: Some(lsp_types::CodeActionClientCapabilities {
+                        code_action_literal_support: Some(lsp_types::CodeActionLiteralSupport {
+                            code_action_kind: lsp_types::CodeActionKindLiteralSupport {
+                                value_set: vec![
+                                    "".to_string(),
+                                    "quickfix".to_string(),
+                                    "refactor".to_string(),
+                                    "refactor.extract".to_string(),
+                                    "refactor.inline".to_string(),
+                                    "refactor.rewrite".to_string(),
+                                    "source".to_string(),
+                                    "source.organizeImports".to_string(),
+                                    "source.fixAll".to_string(),
+                                ],
+                            },
+                        }),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -227,6 +249,7 @@ impl LspClient {
             "textDocument/documentSymbol" => "documentSymbolProvider",
             "textDocument/rename" => "renameProvider",
             "workspace/symbol" => "workspaceSymbolProvider",
+            "textDocument/codeAction" => "codeActionProvider",
             "workspace/didChangeWatchedFiles" => "didChangeWatchedFiles",
             _ => return true,
         };
