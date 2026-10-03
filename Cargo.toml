@@ -16,6 +16,10 @@ path = "src/main.rs"
 [workspace]
 members = ["xtask"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

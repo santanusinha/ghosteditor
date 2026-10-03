@@ -476,11 +476,18 @@ fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             return Ok(reply);
         };
         // Give a fast server a moment to push its first batch (P1.5).
-        let settle = 300u64;
-        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
-        let pushed = client.diagnostics_for(&path).await;
+        // Poll instead of a fixed sleep: a warm mailbox answers at once,
+        // a cold one waits at most the same 300 ms.
+        let pushed = {
+            let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let mut pushed = client.diagnostics_for(&path).await;
+            while pushed.is_none() && std::time::Instant::now() < settle {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                pushed = client.diagnostics_for(&path).await;
+            }
+            pushed
+        };
         let items = pushed.map(|p| p.diagnostics).unwrap_or_default();
-        let _names = ["ERROR", "WARN", "INFO", "HINT"];
         let rendered: Vec<String> = items
             .iter()
             .map(|d| {
@@ -1155,6 +1162,23 @@ fn run_open_file(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             .language_for(&path)
             .map(|(name, _)| name)
             .unwrap_or_else(|| "unknown".to_string());
+        // G6: warm the language server in the background while the agent
+        // reads. Detached, best effort, and never blocks this reply. The
+        // pool is keyed per language, so repeated opens reuse one client.
+        if facts.exists {
+            let server = server.clone();
+            let warm_path = path.clone();
+            tokio::spawn(async move {
+                if let Ok(Some((language, client))) = server.lsp.client_for_path(&warm_path).await {
+                    let text = { server.store.lock().await.text(&warm_path) };
+                    if let Some(text) = text {
+                        client
+                            .did_open_or_change(&language, &warm_path, &text)
+                            .await;
+                    }
+                }
+            });
+        }
         Ok(json!({
             "text": format!(
                 "Opened {}. exists={} lines={} language={}",
