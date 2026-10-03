@@ -307,6 +307,7 @@ fn registry() -> &'static Vec<Tool> {
                     "path": { "type": "string", "description": "File for the document outline" },
                     "query": { "type": "string", "description": "Name search across the workspace" },
                     "max_results": { "type": "integer", "default": 200, "description": "Cap on returned symbols" },
+                    "offset": { "type": "integer", "description": "Skip this many results; from next_offset of the previous page" },
                     "deadline_ms": { "type": "integer" }
                 },
                 "required": []
@@ -1657,13 +1658,15 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             let result = result?;
             let items = symbol_items(&result);
             let total = items.len();
-            let page: Vec<Value> = items.into_iter().take(max_results).collect();
-            let truncated = total > page.len();
-            let next_offset = if truncated {
-                json!(max_results)
-            } else {
-                Value::Null
-            };
+            let offset = arguments
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let offset = offset.min(total);
+            let end = offset.saturating_add(max_results).min(total);
+            let page: Vec<Value> = items.into_iter().skip(offset).take(end - offset).collect();
+            let truncated = end < total;
+            let next_offset = if truncated { json!(end) } else { Value::Null };
             let text = if page.is_empty() {
                 "No symbols found.".to_string()
             } else {

@@ -312,6 +312,38 @@ fn mock_workspace_symbol_search() {
 }
 
 #[test]
+fn mock_workspace_symbol_offset_pagination() {
+    if !python3_present() {
+        eprintln!("python3 absent; skipping");
+        return;
+    }
+    let (_dir, root) = two_language_workspace();
+    let cwd = root.display().to_string();
+    let mut messages = initialize_messages();
+    // The mock answers one symbol; offset beyond the total yields an empty
+    // page with total intact (P3.2 hardening).
+    messages.push(call(
+        2,
+        "symbols",
+        serde_json::json!({"path": "a.one", "query": "alp", "offset": 1}),
+    ));
+    messages.push(call(
+        3,
+        "symbols",
+        serde_json::json!({"path": "a.one", "query": "alp", "max_results": 1}),
+    ));
+    let responses = drive(&["--cwd", &cwd], &messages);
+    let past_end = struct_content(by_id(&responses, 2));
+    assert_eq!(past_end["total"], 1);
+    assert_eq!(past_end["count"], 0);
+    assert!(!past_end["truncated"].as_bool().unwrap_or(true));
+    assert!(past_end["next_offset"].is_null());
+    let page = struct_content(by_id(&responses, 3));
+    assert_eq!(page["count"], 1);
+    assert_eq!(page["symbols"].as_array().unwrap()[0]["name"], "alpha");
+}
+
+#[test]
 fn mock_goto_definition_and_references() {
     if !python3_present() {
         eprintln!("python3 absent; skipping");
