@@ -6,7 +6,9 @@
 //! `next_offset` cursor when more matches exist.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// A single match. Lines and columns are 1-based, like every ghostedit tool.
 #[derive(Debug, Clone, PartialEq)]
@@ -55,12 +57,21 @@ const SKIP_DIRS: &[&str] = &[
     ".pytest_cache",
 ];
 
+/// Matches kept in memory per search. Counting always covers every
+/// match; storage stops past this bound so a pathological tree cannot
+/// balloon memory. Realistic pages (offset + 200 up to this bound) stay
+/// exact.
+const STORE_LIMIT: usize = 100_000;
+
 /// Search the workspace under `root`. `query` is a case-insensitive
 /// substring when `regex` is false, else a regex pattern. `offset` skips
 /// the first `offset` matches for pagination. `glob` restricts the walk
-/// to files whose root-relative path matches (P3.5 dogfood mitigation:
-/// a 43k-file repo walks in ~6 s; a glob keeps the common case inside
-/// the deadline). A regex compile error is returned as a string.
+/// to files whose root-relative path matches. A regex compile error is
+/// returned as a string.
+///
+/// Phase 1 collects candidate files (metadata only). Phase 2 scans them
+/// on the thread pool. Phase 3 sorts by (path, line, column) and applies
+/// the offset window, so pagination is deterministic across runs.
 pub fn search(
     root: &Path,
     query: &str,
@@ -79,33 +90,57 @@ pub fn search(
         Pattern::Literal(query.to_string())
     };
     let ignore = GitignoreSet::load(root);
-    let mut result = SearchResult::default();
-    let mut cursor = 0usize; // Index of the next match overall.
-    walk(
-        root,
-        root,
-        &ignore,
-        &pattern,
-        glob,
-        offset,
-        &mut cursor,
-        &mut result,
-    )?;
-    result.truncated = cursor > offset + result.matches.len();
-    Ok(result)
+
+    let mut files = Vec::new();
+    collect_files(root, root, &ignore, &mut files)?;
+
+    let total = AtomicUsize::new(0);
+    let scanned = AtomicUsize::new(0);
+    let next_file = AtomicUsize::new(0);
+    let stored = Mutex::new(Vec::new());
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let index = next_file.fetch_add(1, Ordering::Relaxed);
+                if index >= files.len() {
+                    break;
+                }
+                scan_file(
+                    root,
+                    &files[index],
+                    &pattern,
+                    glob,
+                    &total,
+                    &scanned,
+                    &stored,
+                );
+            });
+        }
+    });
+
+    let mut all = stored.into_inner().unwrap_or_default();
+    all.sort_by(|a, b| (&a.path, a.line, a.column).cmp(&(&b.path, b.line, b.column)));
+    let page: Vec<Match> = all.into_iter().skip(offset).take(MAX_MATCHES).collect();
+    let truncated = total.load(Ordering::Relaxed) > offset + page.len();
+    Ok(SearchResult {
+        matches: page,
+        files_scanned: scanned.load(Ordering::Relaxed),
+        truncated,
+    })
 }
 
-/// Depth-first walk. `root` stays the workspace root so relative paths
-/// stay stable at any depth.
-fn walk(
-    root: &Path,
+/// Collect candidate files under `dir`. Metadata only; no file is read
+/// here. `root` stays the workspace root so relative paths stay stable.
+fn collect_files(
+    _root: &Path,
     dir: &Path,
     parent_ignore: &GitignoreSet,
-    pattern: &Pattern,
-    glob: Option<&str>,
-    offset: usize,
-    cursor: &mut usize,
-    result: &mut SearchResult,
+    files: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     // Load this directory's .gitignore before matching its children.
     let ignore = parent_ignore.clone_for_dir(dir);
@@ -120,79 +155,91 @@ fn walk(
             if SKIP_DIRS.contains(&name) || ignore.matches(&path, true) {
                 continue;
             }
-            walk(root, &path, &ignore, pattern, glob, offset, cursor, result)?;
+            collect_files(dir, &path, &ignore, files)?;
         } else if path.is_file() {
             if ignore.matches(&path, false) {
                 continue;
             }
-            scan_file(root, &path, pattern, glob, offset, cursor, result)?;
+            files.push(path);
         }
     }
     Ok(())
 }
 
-/// Scan one file for matches, applying the pagination cursor.
+/// Scan one file: count every match, and store the ones that fit the
+/// storage window. The glob filter runs before any I/O so a scoped
+/// search never reads files it will not scan (P3.5). Infallible: an
+/// unreadable file contributes nothing.
 fn scan_file(
     root: &Path,
     path: &Path,
     pattern: &Pattern,
     glob: Option<&str>,
-    offset: usize,
-    cursor: &mut usize,
-    result: &mut SearchResult,
-) -> Result<(), String> {
-    // The glob filter runs before any I/O so a scoped search never
-    // reads files it will not scan (P3.5).
+    total: &AtomicUsize,
+    scanned: &AtomicUsize,
+    stored: &Mutex<Vec<Match>>,
+) {
     let relative = path
         .strip_prefix(root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path.display().to_string());
     if let Some(glob) = glob {
         if !glob_matches(glob, &relative) {
-            return Ok(());
+            return;
         }
     }
     let Ok(metadata) = fs::metadata(path) else {
-        return Ok(());
+        return;
     };
     if metadata.len() > MAX_FILE_BYTES {
-        return Ok(());
+        return;
     }
     let Ok(bytes) = fs::read(path) else {
-        return Ok(());
+        return;
     };
     // A NUL byte in the first 8 KiB marks a binary file.
     if bytes[..bytes.len().min(8192)].contains(&0) {
-        return Ok(());
+        return;
     }
     let Ok(text) = String::from_utf8(bytes) else {
-        return Ok(());
+        return;
     };
+    scanned.fetch_add(1, Ordering::Relaxed);
+    let mut local: Vec<Match> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         match pattern {
             Pattern::Literal(needle) => {
-                let Some(at) = find_substring(line, needle) else {
-                    continue;
-                };
-                emit(&relative, index, at, line, offset, cursor, result);
+                if let Some(at) = find_substring(line, needle) {
+                    local.push(Match {
+                        path: relative.clone(),
+                        line: index + 1,
+                        column: at + 1,
+                        text: truncate_line(line),
+                    });
+                }
             }
             Pattern::Regex(re) => {
                 for found in re.find_iter(line) {
-                    emit(
-                        &relative,
-                        index,
-                        found.start(),
-                        line,
-                        offset,
-                        cursor,
-                        result,
-                    );
+                    local.push(Match {
+                        path: relative.clone(),
+                        line: index + 1,
+                        column: found.start() + 1,
+                        text: truncate_line(line),
+                    });
                 }
             }
         }
     }
-    result.files_scanned += 1;
-    Ok(())
+    if local.is_empty() {
+        return;
+    }
+    let start = total.fetch_add(local.len(), Ordering::Relaxed);
+    if start >= STORE_LIMIT {
+        return;
+    }
+    let keep = local.len().min(STORE_LIMIT - start);
+    local.truncate(keep);
+    stored.lock().expect("walker store poisoned").extend(local);
 }
 
 /// Minimal glob for the search filter: `*` matches within one path
@@ -247,47 +294,30 @@ pub fn glob_matches(glob: &str, path: &str) -> bool {
     false
 }
 
-/// Record one match unless past the cap. Every match advances the cursor
-/// so `truncated` stays correct across pages.
-fn emit(
-    relative: &str,
-    line_index: usize,
-    column: usize,
-    line: &str,
-    offset: usize,
-    cursor: &mut usize,
-    result: &mut SearchResult,
-) {
-    let index = *cursor;
-    *cursor += 1;
-    if index >= offset && result.matches.len() < MAX_MATCHES {
-        result.matches.push(Match {
-            path: relative.to_string(),
-            line: line_index + 1,
-            column: column + 1,
-            text: truncate_line(line),
-        });
-    }
-}
-
 /// Case-insensitive substring search. Returns the byte offset in the
-/// original line. The lowercase copies can change byte lengths, so the
-/// offset maps back through a char walk.
+/// original line. Both sides lowercase once (one allocation, not one per
+/// start position); the offset maps back through a char walk because
+/// lowercase can change byte lengths.
 fn find_substring(hay: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
     let needle_lower = needle.to_lowercase();
-    let chars: Vec<(usize, char)> = hay.char_indices().collect();
-    for start in 0..chars.len() {
-        let slice: String = chars[start..]
-            .iter()
-            .map(|(_, c)| *c)
-            .take(needle.chars().count())
-            .collect();
-        if slice.to_lowercase() == needle_lower {
-            return Some(chars[start].0);
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let hay_lower = hay.to_lowercase();
+    let byte_at = hay_lower.find(&needle_lower)?;
+    // Walk the original chars; each one produced `lower_len` lowercase
+    // bytes. The match starts at the char whose lowercase range holds
+    // `byte_at`.
+    let mut acc = 0usize;
+    for (orig_byte, ch) in hay.char_indices() {
+        let lower_len: usize = ch.to_lowercase().map(|c| c.len_utf8()).sum();
+        if acc + lower_len > byte_at {
+            return Some(orig_byte);
         }
+        acc += lower_len;
     }
     None
 }
