@@ -1,2 +1,3 @@
 /target
 .ghostedit-tmp-*
+__pycache__/
