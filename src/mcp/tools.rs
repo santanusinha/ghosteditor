@@ -442,9 +442,35 @@ fn run_references(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             "position": { "line": line - 1, "character": column - 1 },
             "context": { "includeDeclaration": true }
         });
-        let result = client
-            .request("textDocument/references", params, deadline)
-            .await?;
+        let mut result = client
+            .request("textDocument/references", params.clone(), deadline)
+            .await;
+        // Cold-start guard: a fresh server answers an empty list or a
+        // -32602 refusal before it finished analysis. When no diagnostics
+        // batch has arrived yet, wait for the first push, then retry once
+        // (the position-tool pattern). A warm server with a genuine empty
+        // answer returns at once. The wait stops 1.5 s before the tool
+        // deadline so a still-empty result returns as a clean "no
+        // references" instead of losing a race against the watchdog (the
+        // same discipline as the symbols poll loop; inspector finding).
+        let cold = is_cold_refusal(&result)
+            || matches!(&result, Ok(v) if v.as_array().is_some_and(|a| a.is_empty()));
+        if cold && client.diagnostics_for(&path).await.is_none() {
+            let start = std::time::Instant::now();
+            let wait_until = deadline.saturating_sub(1500);
+            while (start.elapsed().as_millis() as u64) < wait_until {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Any first push (even an empty batch) means the initial
+                // analysis pass finished (gopls pushes empty arrays).
+                if client.diagnostics_for(&path).await.is_some() {
+                    break;
+                }
+            }
+            result = client
+                .request("textDocument/references", params, deadline)
+                .await;
+        }
+        let result = result?;
         let items = result.as_array().cloned().unwrap_or_default();
         let lines: Vec<String> = items
             .iter()
@@ -470,19 +496,25 @@ fn run_diagnostics(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         let raw = arg_str(&arguments, "path").ok_or_else(|| invalid(tool, "path is required"))?;
         let path = resolve_path(&server.config, &raw);
         ensure_did_open(&server, &path).await?;
+        let deadline = deadline_for(&server, &path, DeadlineKind::Read, &arguments);
         let Some((_language, client)) = server.lsp.client_for_path(&path).await? else {
             let mut reply = missing_server(&server, &raw, &path).await?;
             reply["diagnostics"] = json!([]);
             return Ok(reply);
         };
-        // Give a fast server a moment to push its first batch (P1.5).
-        // Poll instead of a fixed sleep: a warm mailbox answers at once,
-        // a cold one waits at most the same 300 ms.
+        // Wait for the first diagnostics push (P1.5, hardened after the
+        // inspector run). A warm mailbox answers at once. The old fixed
+        // 300 ms settle turned into false "No diagnostics." answers on a
+        // cold server, whose first pass takes longer. The wait stops 1.5 s
+        // before the tool deadline so a still-empty mailbox returns as a
+        // clean "no diagnostics" instead of losing a race against the
+        // watchdog (the same discipline as the symbols poll loop).
         let pushed = {
-            let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let start = std::time::Instant::now();
+            let wait_until = deadline.saturating_sub(1500);
             let mut pushed = client.diagnostics_for(&path).await;
-            while pushed.is_none() && std::time::Instant::now() < settle {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            while pushed.is_none() && (start.elapsed().as_millis() as u64) < wait_until {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 pushed = client.diagnostics_for(&path).await;
             }
             pushed
@@ -1656,15 +1688,33 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             ));
         }
 
-        // Workspace-wide name search. The path picks the server.
+        // Workspace-wide name search. A path picks the server; a bare
+        // query reuses any live client, then spawns the first config
+        // language. No candidate at all is a structured error, never a
+        // panic (the inspector caught an expect() here on query-only
+        // calls).
         if let Some(query) = query {
-            let raw = raw_path.expect("checked above");
-            let path = resolve_path(&server.config, &raw);
-            ensure_did_open(&server, &path).await?;
-            let Some((language, client)) = server.lsp.client_for_path(&path).await? else {
-                return missing_server(&server, &raw, &path).await;
+            let (language, client, deadline) = match raw_path.as_deref() {
+                Some(raw) => {
+                    let path = resolve_path(&server.config, raw);
+                    ensure_did_open(&server, &path).await?;
+                    let Some((language, client)) = server.lsp.client_for_path(&path).await? else {
+                        return missing_server(&server, raw, &path).await;
+                    };
+                    let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);
+                    (language, client, deadline)
+                }
+                None => {
+                    let Some((language, client)) = server.lsp.client_for_any().await? else {
+                        return Err(invalid(
+                            tool,
+                            "no language server is available; pass path so the search can pick one",
+                        ));
+                    };
+                    let deadline = clamp_agent(server.config.defaults.symbol, &arguments);
+                    (language, client, deadline)
+                }
             };
-            let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);
             if !client.supports("workspace/symbol").await {
                 return Err(unsupported("workspace/symbol"));
             }
@@ -1672,15 +1722,19 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
             // Cold-start guard: a fresh server answers an empty list before
             // it indexed the workspace. Poll within the deadline until the
             // reply is non-empty (same trade-off as hover: a cold start can
-            // burn the budget; a warm server answers at once).
+            // burn the budget; a warm server answers at once). The poll
+            // stops 1.5 s before the tool deadline so a still-empty result
+            // returns as a clean "no symbols" instead of losing a race
+            // against the watchdog (inspector finding).
             let start = std::time::Instant::now();
+            let poll_until = deadline.saturating_sub(1500);
             let mut result = client
                 .request("workspace/symbol", params.clone(), deadline)
                 .await;
             loop {
                 let cold_empty =
                     matches!(&result, Ok(v) if v.as_array().is_some_and(|a| a.is_empty()));
-                if !cold_empty || start.elapsed().as_millis() as u64 >= deadline {
+                if !cold_empty || start.elapsed().as_millis() as u64 >= poll_until {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1720,7 +1774,12 @@ fn run_symbols(server: Arc<Server>, arguments: Value) -> BoxedFuture {
         }
 
         // Document outline.
-        let raw = raw_path.expect("checked above");
+        let Some(raw) = raw_path else {
+            return Err(invalid(
+                tool,
+                "pass path for an outline, or query for name search",
+            ));
+        };
         let path = resolve_path(&server.config, &raw);
         ensure_did_open(&server, &path).await?;
         let deadline = deadline_for(&server, &path, DeadlineKind::Symbol, &arguments);

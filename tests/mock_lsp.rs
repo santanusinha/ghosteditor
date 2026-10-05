@@ -93,13 +93,18 @@ fn struct_content(response: &serde_json::Value) -> &serde_json::Value {
 /// The mock script. argv[1] selects the scenario:
 /// - a language tag (shown in hover replies)
 /// - "nocaps": advertise no capabilities at all
+/// - "coldrefs": delays the first diagnostics push until after the first
+///   references reply answers [] (the cold-start shape)
 const MOCK_LSP: &str = r#"
-import sys, json
+import sys, json, time
 
 LANG = "unknown"
 if len(sys.argv) > 1:
     LANG = sys.argv[1]
 NO_CAPS = LANG == "nocaps"
+COLD = LANG == "coldrefs"
+COLD_DIAG = LANG == "colddiag"
+COLD_REFS_SEEN = 0
 
 def recv():
     headers = {}
@@ -147,6 +152,10 @@ while True:
         break
     elif method == "textDocument/didOpen":
         doc = msg["params"]["textDocument"]
+        if COLD:
+            continue  # cold start: no push until the first references call
+        if COLD_DIAG:
+            time.sleep(0.5)  # the first analysis pass is slow
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
             "uri": doc["uri"],
             "diagnostics": [{
@@ -165,6 +174,17 @@ while True:
             {"uri": msg["params"]["textDocument"]["uri"], "range": range(0, 0, 0, 1)}
         ]})
     elif method == "textDocument/references":
+        if COLD:
+            COLD_REFS_SEEN += 1
+            if COLD_REFS_SEEN == 1:
+                send({"jsonrpc": "2.0", "id": msg["id"], "result": []})
+                # The first analysis pass finishes only now.
+                time.sleep(0.5)
+                send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+                    "uri": msg["params"]["textDocument"]["uri"],
+                    "diagnostics": [],
+                }})
+                continue
         send({"jsonrpc": "2.0", "id": msg["id"], "result": [
             {"uri": msg["params"]["textDocument"]["uri"], "range": range(1, 0, 1, 3)},
             {"uri": msg["params"]["textDocument"]["uri"], "range": range(2, 0, 2, 3)},
@@ -215,6 +235,46 @@ command = ["python3", "mock_lsp.py", "two"]
     .unwrap();
     std::fs::write(root.join("a.one"), "alpha beta\nsecond line\nthird line\n").unwrap();
     std::fs::write(root.join("b.two"), "alpha beta\nsecond line\nthird line\n").unwrap();
+    (dir, root)
+}
+
+/// Build a temp workspace whose mock server delays its first diagnostics
+/// push until after the first references reply answers [] (cold start).
+fn cold_references_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("mock_lsp.py"), MOCK_LSP).unwrap();
+    std::fs::create_dir_all(root.join(".ghostedit")).unwrap();
+    std::fs::write(
+        root.join(".ghostedit/config.toml"),
+        r#"
+[languages.cold]
+extensions = [".cold"]
+command = ["python3", "mock_lsp.py", "coldrefs"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("a.cold"), "alpha beta\nsecond line\nthird line\n").unwrap();
+    (dir, root)
+}
+
+/// Build a temp workspace whose mock server delays its first diagnostics
+/// push past the tool's old fixed settle window (cold start).
+fn cold_diagnostics_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("mock_lsp.py"), MOCK_LSP).unwrap();
+    std::fs::create_dir_all(root.join(".ghostedit")).unwrap();
+    std::fs::write(
+        root.join(".ghostedit/config.toml"),
+        r#"
+[languages.slow]
+extensions = [".slow"]
+command = ["python3", "mock_lsp.py", "colddiag"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("a.slow"), "alpha beta\nsecond line\nthird line\n").unwrap();
     (dir, root)
 }
 
@@ -318,6 +378,25 @@ fn mock_workspace_symbol_search() {
 }
 
 #[test]
+fn mock_workspace_symbol_query_only_picks_a_server() {
+    // Regression: query-only symbols used to panic on an expect()
+    // (inspector finding). It must reuse any live client instead.
+    if !python3_present() {
+        eprintln!("python3 absent; skipping");
+        return;
+    }
+    let (_dir, root) = two_language_workspace();
+    let cwd = root.display().to_string();
+    let mut messages = initialize_messages();
+    messages.push(call(2, "symbols", serde_json::json!({"query": "alp"})));
+    let responses = drive(&["--cwd", &cwd], &messages);
+    let content = struct_content(by_id(&responses, 2));
+    assert_eq!(content["total"], 1, "content: {content}");
+    let symbols = content["symbols"].as_array().unwrap();
+    assert_eq!(symbols[0]["name"], "alpha");
+}
+
+#[test]
 fn mock_workspace_symbol_offset_pagination() {
     if !python3_present() {
         eprintln!("python3 absent; skipping");
@@ -375,6 +454,55 @@ fn mock_goto_definition_and_references() {
     let refs = struct_content(by_id(&responses, 3));
     assert_eq!(refs["count"], 2);
     assert!(refs["text"].as_str().unwrap().contains("b.two:2:1"));
+}
+
+#[test]
+fn mock_references_cold_start_retries_after_first_push() {
+    // Regression: a cold server answered [] and the tool returned
+    // "No references found." (inspector finding). The guard must wait
+    // for the first diagnostics push and retry once.
+    if !python3_present() {
+        eprintln!("python3 absent; skipping");
+        return;
+    }
+    let (_dir, root) = cold_references_workspace();
+    let cwd = root.display().to_string();
+    let mut messages = initialize_messages();
+    messages.push(call(
+        2,
+        "references",
+        serde_json::json!({"path": "a.cold", "line": 1, "column": 2}),
+    ));
+    let responses = drive(&["--cwd", &cwd], &messages);
+    let content = struct_content(by_id(&responses, 2));
+    assert_eq!(content["count"], 2, "content: {content}");
+    assert!(content["text"].as_str().unwrap().contains("a.cold:2:1"));
+}
+
+#[test]
+fn mock_diagnostics_wait_for_the_first_push() {
+    // Regression: the fixed 300 ms settle returned "No diagnostics." when
+    // the server's first push came later (inspector finding). The tool
+    // must wait for the first push within its deadline.
+    if !python3_present() {
+        eprintln!("python3 absent; skipping");
+        return;
+    }
+    let (_dir, root) = cold_diagnostics_workspace();
+    let cwd = root.display().to_string();
+    let mut messages = initialize_messages();
+    messages.push(call(
+        2,
+        "diagnostics",
+        serde_json::json!({"path": "a.slow"}),
+    ));
+    let responses = drive(&["--cwd", &cwd], &messages);
+    let content = struct_content(by_id(&responses, 2));
+    let text = content["text"].as_str().unwrap();
+    assert!(
+        text.contains("mock diagnostic in colddiag"),
+        "text was: {text}"
+    );
 }
 
 #[test]

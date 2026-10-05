@@ -290,6 +290,35 @@ impl LspManager {
         client.map(|client| (language, client))
     }
 
+    /// Any usable client for a request that carries no path (query-only
+    /// workspace symbol search). Preference order: a live spawned client
+    /// (lowest language name, deterministic), then the first config
+    /// language (spawns it). None when nothing is up and the config has
+    /// no languages. The guard is never held across an await.
+    pub async fn client_for_any(&self) -> Result<Option<(String, Arc<LspClient>)>, ToolError> {
+        let reused = {
+            let clients = self.clients.lock().await;
+            clients
+                .keys()
+                .min()
+                .cloned()
+                .and_then(|language| clients.get(&language).map(|c| (language, c.clone())))
+        };
+        if let Some((language, client)) = reused {
+            if !client.is_dead() {
+                self.touch(&language).await;
+                return Ok(Some((language, client)));
+            }
+        }
+        match self.config.languages.keys().min().cloned() {
+            Some(language) => {
+                let client = self.client_for(&language).await?;
+                Ok(client.map(|c| (language, c)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Spawn (or reuse) a client for a language with an explicit command.
     /// Mirrors `client_for`, but the command comes from the registry.
     async fn client_for_command(
